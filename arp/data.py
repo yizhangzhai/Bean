@@ -102,6 +102,135 @@ def make_fraud_data(
     )
 
 
+def make_fraud_data_large(
+    n: int = 2_000_000,
+    n_features: int = 1000,
+    seed: int = 0,
+    block: int = 100,
+) -> FraudData:
+    """Memory-safe large generator: float32 X filled in column blocks.
+
+    Same three hidden signatures as make_fraud_data, planted in features 0-5;
+    the remaining n_features-6 columns are pure noise -- a needle-in-haystack
+    test of whether the miner finds the right few features among many.
+    """
+    rng = np.random.default_rng(seed)
+    X = np.empty((n, n_features), dtype=np.float32)
+    for start in range(0, n_features, block):
+        end = min(start + block, n_features)
+        X[:, start:end] = rng.standard_normal((n, end - start), dtype=np.float32)
+    # heavy-tailed signal features
+    X[:, 0] = rng.lognormal(0.0, 1.0, size=n).astype(np.float32)
+    X[:, 1] = rng.exponential(1.0, size=n).astype(np.float32)
+
+    feature_names = [f"f{i:04d}" for i in range(n_features)]
+    type_names = ["account_takeover", "collusion", "friendly_fraud"]
+
+    def pc(j, q):
+        return np.quantile(X[:, j], q)
+
+    sig0 = (X[:, 1] > pc(1, 0.95)) & (X[:, 0] > pc(0, 0.90))
+    sig1 = ((X[:, 2] > pc(2, 0.40)) & (X[:, 2] < pc(2, 0.55)) & (X[:, 3] < pc(3, 0.10)))
+    sig2 = (X[:, 4] > pc(4, 0.80)) & (X[:, 5] > pc(5, 0.75))
+
+    ground_truth = [
+        "f0001 > p95  AND  f0000 > p90",
+        "p40 < f0002 < p55  AND  f0003 < p10",
+        "f0004 > p80  AND  f0005 > p75",
+    ]
+    fire_prob = [0.85, 0.80, 0.70]
+    bg_prob = [0.001, 0.001, 0.004]
+    loss_scale = [9.0, 7.5, 6.0]
+
+    Y = np.zeros((n, 3), dtype=np.int64)
+    loss = np.zeros((n, 3), dtype=np.float64)
+    for c, sig in enumerate((sig0, sig1, sig2)):
+        p = np.where(sig, fire_prob[c], bg_prob[c])
+        Y[:, c] = (rng.uniform(size=n) < p).astype(np.int64)
+        idx = Y[:, c] == 1
+        loss[idx, c] = rng.lognormal(loss_scale[c], 1.1, size=int(idx.sum()))
+
+    return FraudData(X, Y, loss, feature_names, type_names, ground_truth)
+
+
+def make_binned_fraud_data_large(
+    n: int = 2_000_000,
+    n_features: int = 1000,
+    n_bins: int = 10,
+    seed: int = 0,
+    block: int = 50,
+):
+    """Fused generate+bin: never holds the full float X in memory.
+
+    Generates each column block, bins it to int8 immediately, and discards the
+    floats -- so peak memory is Xbin (N*F bytes) + one block, not the 8GB float
+    matrix. Returns (Xbin, BinSpec, Y, loss, feature_names, type_names,
+    ground_truth). This is the memory-pressure fix for the 78-min fit_bins seen
+    when the float X and Xbin were both resident at 2M x 1000.
+    """
+    from .fast import BinSpec
+
+    rng = np.random.default_rng(seed)
+    qs = np.arange(1, n_bins) / n_bins
+    Xbin = np.empty((n, n_features), dtype=np.int8)
+    edges: list[np.ndarray] = [None] * n_features
+
+    def bin_col(j, col):
+        e = np.quantile(col, qs)
+        edges[j] = e.astype(np.float64)
+        Xbin[:, j] = np.searchsorted(e, col, side="right").astype(np.int8)
+
+    # signal features kept as float just long enough to define signatures
+    f0 = rng.lognormal(0.0, 1.0, size=n).astype(np.float32)
+    f1 = rng.exponential(1.0, size=n).astype(np.float32)
+    f2, f3, f4, f5 = (rng.standard_normal(n, dtype=np.float32) for _ in range(4))
+
+    def pc(col, q):
+        return np.quantile(col, q)
+
+    sig0 = (f1 > pc(f1, 0.95)) & (f0 > pc(f0, 0.90))
+    sig1 = (f2 > pc(f2, 0.40)) & (f2 < pc(f2, 0.55)) & (f3 < pc(f3, 0.10))
+    sig2 = (f4 > pc(f4, 0.80)) & (f5 > pc(f5, 0.75))
+
+    for j, col in enumerate((f0, f1, f2, f3, f4, f5)):
+        bin_col(j, col)
+
+    type_names = ["account_takeover", "collusion", "friendly_fraud"]
+    fire_prob, bg_prob, loss_scale = [0.85, 0.80, 0.70], [0.001, 0.001, 0.004], [9.0, 7.5, 6.0]
+    Y = np.zeros((n, 3), dtype=np.int64)
+    loss = np.zeros((n, 3), dtype=np.float64)
+    for c, sig in enumerate((sig0, sig1, sig2)):
+        p = np.where(sig, fire_prob[c], bg_prob[c])
+        Y[:, c] = (rng.uniform(size=n) < p).astype(np.int64)
+        idx = Y[:, c] == 1
+        loss[idx, c] = rng.lognormal(loss_scale[c], 1.1, size=int(idx.sum()))
+    del f0, f1, f2, f3, f4, f5
+
+    # remaining noise features: generate -> bin -> discard, block by block
+    for start in range(6, n_features, block):
+        end = min(start + block, n_features)
+        Xf = rng.standard_normal((n, end - start), dtype=np.float32)
+        for jj in range(end - start):
+            bin_col(start + jj, Xf[:, jj])
+        del Xf
+
+    feature_names = [f"f{i:04d}" for i in range(n_features)]
+    ground_truth = [
+        "f0001 > p95  AND  f0000 > p90",
+        "p40 < f0002 < p55  AND  f0003 < p10",
+        "f0004 > p80  AND  f0005 > p75",
+    ]
+    return Xbin, BinSpec(edges, qs, n_bins), Y, loss, feature_names, type_names, ground_truth
+
+
+# ground-truth signal features per type, for recovery scoring
+GROUND_TRUTH_FEATURES = {
+    "account_takeover": {0, 1},
+    "collusion": {2, 3},
+    "friendly_fraud": {4, 5},
+}
+
+
 def train_val_split(
     data: FraudData, val_frac: float = 0.33, seed: int = 1
 ) -> tuple[np.ndarray, np.ndarray]:
