@@ -105,7 +105,11 @@ arp/
   fast.py        SCALABLE miner: int8 histogram bins, no dense M, subset rescan
   bitset.py      coarse-to-fine feature pruning + bitmask (AND/popcount) conjunctions
   targeted.py    precision/recall-targeted growth (admissible recall-floor prune,
-                 precision-target stop, train/val-gap overfit brake)
+                 precision-target stop, train/val-gap overfit brake); accepts a
+                 RulePolicy to enforce interpretability constraints in-search
+  constraints.py RulePolicy: monotone direction / 1-way-2-way / threshold range /
+                 disable / forbidden+mutually-exclusive feature pairs
+  mixed.py       numeric + categorical predicates (==, in-set via Fisher trick)
   portfolio.py   greedy maximin type-balanced rule portfolio
   baselines.py   sklearn decision-tree comparison
   demo.py        end-to-end runnable demo
@@ -118,6 +122,8 @@ experiments/
   hard_recovery.py deep/disjunctive/banded/XOR recovery (4 full,1 partial,1 miss)
   hard_scale.py  hard-pattern mining time+space at scale
   deep10.py      depth-10 rule recovery (3/3) -- 200K x 100, 7.6s, 0.34GB
+  mixed_recovery.py numeric+categorical recovery (3/3, exact category subsets)
+  constrained.py interpretability constraints enforced during discovery
 tests/           smoke + correctness (label-as-query identity, GT recovery, ...)
 ```
 

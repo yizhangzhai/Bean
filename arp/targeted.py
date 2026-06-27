@@ -98,8 +98,13 @@ def targeted_beam_search(
     max_depth=4,
     Xbin_val=None, Y_val=None, gap_tol=None,
     max_accept=2000,
+    policy=None,
 ):
     """Grow rules toward (precision >= target, recall >= floor); return accepted.
+
+    `policy` (arp.constraints.RulePolicy) enforces interpretability constraints
+    during discovery -- allowed split directions / ranges / 1-way / forbidden
+    feature pairs -- so every emitted rule is compliant by construction.
 
     Returns (accepted, trace) where trace logs why paths stopped. `max_accept`
     caps the accepted pool so a strong, common pattern can't generate tens of
@@ -162,10 +167,14 @@ def targeted_beam_search(
             beam.append(r)
         return beam
 
+    nb = spec.n_bins
+
     # ---- depth 1 ----
     acc_c, grow_c = [], []
     for f in range(F):
-        for op, k, s, tp in _hist_tp(Xbin[:, f], yc, spec.n_bins, min_support):
+        for op, k, s, tp in _hist_tp(Xbin[:, f], yc, nb, min_support):
+            if policy is not None and not policy.pred_ok(f, op, k, nb):
+                continue
             r = make_rule([(f, op, k)], s, tp, 1)
             a = triage_train(r)
             if a == "prune":
@@ -183,10 +192,15 @@ def targeted_beam_search(
             idx = np.flatnonzero(r.mask)
             sub_yc = yc[idx]
             used = r.used()
+            rfeats = {pf for pf, _ in used}
             for f in range(F):
                 xb = Xbin[idx, f]
-                for op, k, s, tp in _hist_tp(xb, sub_yc, spec.n_bins, min_support):
+                for op, k, s, tp in _hist_tp(xb, sub_yc, nb, min_support):
                     if (f, op) in used:
+                        continue
+                    if policy is not None and (
+                            not policy.pred_ok(f, op, k, nb)
+                            or not policy.extend_ok(rfeats, f, op)):
                         continue
                     nr = make_rule(r.preds + ((f, op, k),), s, tp, depth)
                     a = triage_train(nr)
@@ -216,6 +230,8 @@ def targeted_beam_search(
     cand = sorted(uniq.values(), key=lambda r: (len(r.preds), -r.precision))
     kept, kept_sets = [], []
     for r in cand:
+        if policy is not None and not policy.rule_ok({f for f, _, _ in r.preds}):
+            continue                                  # required-with not satisfied
         fs = frozenset(r.preds)
         if any(ks <= fs for ks in kept_sets):
             continue
