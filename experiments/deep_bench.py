@@ -232,6 +232,24 @@ def deep_experiment(n, n_features, *, seed=0, target_precision=0.6,
     print(f"    [mine {log['mine']:.1f}s]   accepted rules: {len(rules)}   "
           f"peak RSS {peak_gb():.2f} GB")
 
+    # ---- COVERAGE / ACCURACY of the whole rule set (do the rules catch the
+    #      bads, even where the exact deep conjunction was not recovered?) ----
+    from arp.fast import rule_mask
+    cov = np.zeros(len(va), dtype=bool)
+    for r in rules:
+        cov |= rule_mask(r.preds, Xva)
+    pos = y[va] == 1
+    tp = int((cov & pos).sum())
+    recall = tp / max(1, int(pos.sum()))
+    precision = tp / max(1, int(cov.sum()))
+    accuracy = float((cov == pos).mean())
+    pmrec = [float((cov & m[va]).sum() / max(1, int(m[va].sum()))) for m in mo_masks]
+    print(f"\n    RULE-SET COVERAGE (val):  recall={recall:.2f}  "
+          f"precision={precision:.2f}  accuracy={accuracy:.3f}  "
+          f"(flagged {int(cov.sum()):,}/{len(va):,})")
+    print("    per-pattern recall:  " +
+          "  ".join(f"d{d}={pmrec[p]:.2f}" for p, d in enumerate(DEPTHS)))
+
     # ---- blind discovery + oracle prefix-precision curve ----
     base = float(y[va].mean())
     print(f"\n    base fraud rate (val) = {base:.3f}")
@@ -263,7 +281,9 @@ def deep_experiment(n, n_features, *, seed=0, target_precision=0.6,
                            encode=log["encode"], mine=log["mine"],
                            generate=log["generate"], total=total,
                            peak_gb=peak_gb(), n_rules=len(rules),
-                           recovered=[r["recovered"] for r in recs])
+                           recovered=[r["recovered"] for r in recs],
+                           recall=recall, precision=precision, accuracy=accuracy,
+                           per_pattern=pmrec)
     return log
 
 
@@ -275,22 +295,24 @@ def print_summary(rows):
     print("-" * len(hdr))
     for log in rows:
         s = log["_summary"]
-        rec = " ".join(f"{r}/{d}" for r, d in zip(s["recovered"], DEPTHS))
+        pm = " ".join(f"d{d}={r:.2f}" for r, d in zip(s["per_pattern"], DEPTHS))
         print(f"{s['n']//1000}K x {s['n_features']:>4} | {s['generate']:6.1f} "
               f"{s['encode']:7.1f} {s['mine']:7.1f} {s['total']:7.1f} | "
-              f"{s['peak_gb']:7.2f}G | {s['n_rules']:6d} | blind recovered: {rec}")
+              f"{s['peak_gb']:7.2f}G | recall={s['recall']:.2f} prec={s['precision']:.2f} | {pm}")
 
 
 SCALES = {"small": (200_000, 500), "large": (2_000_000, 1000)}
 
 if __name__ == "__main__":
     which = sys.argv[1] if len(sys.argv) > 1 else "encode"
+    prec = float(sys.argv[2]) if len(sys.argv) > 2 else 0.6
     if which == "encode":
         encode_microbench()
     elif which == "all":
         encode_microbench()
-        rows = [deep_experiment(*SCALES[k]) for k in ("small", "large")]
+        rows = [deep_experiment(*SCALES[k], target_precision=prec)
+                for k in ("small", "large")]
         print_summary(rows)
     else:
-        rows = [deep_experiment(*SCALES[which])]
+        rows = [deep_experiment(*SCALES[which], target_precision=prec)]
         print_summary(rows)
