@@ -58,8 +58,8 @@ class TargetedRule:
         return "  AND  ".join(parts)
 
 
-def _hist_tp(xb, yc, n_bins, min_support):
-    """For one bin column: (op, k, support, tp) over all thresholds."""
+def _hist_tp(xb, yc, n_bins, min_support, active=None):
+    """For one bin column: (op, k, support, tp) over thresholds (active or all)."""
     B = n_bins
     counts = np.bincount(xb, minlength=B).astype(np.float64)
     cc = np.cumsum(counts)
@@ -67,7 +67,8 @@ def _hist_tp(xb, yc, n_bins, min_support):
     tot = wc[-1]
     Ncur = xb.shape[0]
     out = []
-    for k in range(B - 1):
+    ks = range(B - 1) if active is None else active
+    for k in ks:
         for op, s, tp in (("<", cc[k], wc[k]), (">", Ncur - cc[k], tot - wc[k])):
             if s >= min_support:
                 out.append((op, k, float(s), float(tp)))
@@ -193,7 +194,10 @@ def targeted_beam_search(
     pr0 = (pruned["recall<floor"], pruned["train/val gap"], len(accepted))
     acc_c, grow_c, explored = [], [], 0
     for f in range(F):
-        for op, k, s, tp in _hist_tp(Xbin[:, f], yc, nb, min_support):
+        af = spec.active_for(f)
+        if af is not None and len(af) == 0:        # feature has no useful cut
+            continue
+        for op, k, s, tp in _hist_tp(Xbin[:, f], yc, nb, min_support, af):
             if policy is not None and not policy.pred_ok(f, op, k, nb):
                 continue
             explored += 1
@@ -219,8 +223,11 @@ def targeted_beam_search(
             used = r.used()
             rfeats = {pf for pf, _ in used}
             for f in range(F):
+                af = spec.active_for(f)
+                if af is not None and len(af) == 0:
+                    continue
                 xb = Xbin[idx, f]
-                for op, k, s, tp in _hist_tp(xb, sub_yc, nb, min_support):
+                for op, k, s, tp in _hist_tp(xb, sub_yc, nb, min_support, af):
                     if (f, op) in used:
                         continue
                     if policy is not None and (

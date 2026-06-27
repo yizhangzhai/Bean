@@ -88,6 +88,7 @@ maximize the worst-covered type) rather than forcing one rule to be a generalist
 | **Dollar / cost weighting** | everywhere | swap counts for `$`; negative entries net out false-positive cost |
 | Reference beam search + coarse-to-fine refine | `search.py` | clear, didactic implementation |
 | **Scalable miner** (histogram / cumsum, no dense `M`) | `fast.py` | int8 bins, subset-rescan; 2M × 1000 feasible |
+| **Supervised binning** (chi-square-gated active thresholds) | `fast.fit_bins(supervised=True)` | keeps cuts only where the fraud rate changes → fewer candidates, faster, *cleaner* rules |
 | **Coarse-to-fine feature pruning + bitmask** | `bitset.py` | `AND`/`popcount`; 4.8×–9× faster `mine` |
 | **Precision/recall-targeted growth** | `targeted.py` | recall-floor / precision-target / val-gap |
 | **Type-balanced portfolio** | `portfolio.py` | greedy maximin coverage |
@@ -284,6 +285,17 @@ peak) — a 48× slowdown fixed by never materializing the float matrix.
 **Optimizations:** coarse-to-fine + bitmask gives **4.8×** (1M × 500) to **9.0×**
 (2M × 1000) speedup on `mine` with identical rules.
 
+**Supervised binning** (`fit_bins(supervised=True)`, chi-square-gated active
+thresholds, union across types) — keeps cut points only where the fraud rate
+changes, so noise features collapse to zero active thresholds. On 300K × 250 it
+cut candidate thresholds **−96%** (9,500 → 374), roughly **halved mine time**,
+and made rules far cleaner (collusion: **206 → 2 rules**, noise-feature
+predicates **24% → 0%**, depth 3.9 → 3.0) — recovery preserved. It works because
+conjunction boundaries are marginally visible (every positive funnels through
+each condition), so keeping marginal change-points keeps the cuts that matter;
+the lone blind spot (pure-XOR, zero-marginal interactions) is covered by the
+`featgap` interaction screen. Run: `experiments/supervised_bins.py`.
+
 ---
 
 ## 7. Design principles & honest limitations
@@ -339,7 +351,7 @@ featgap/         SEPARATE feature-engineering layer (depends on arp, not vice
 experiments/     reproducible studies (see experiments/README.md)
   recovery, scale, scale_fused, bitset_bench, targeted, hard_recovery,
   hard_scale, deep10, intervals, mixed_recovery, constrained, constrained_cat,
-  featgap_triage
+  featgap_triage, supervised_bins
 tests/           correctness (label-as-query identity, GT recovery, portfolio, refine)
 ```
 

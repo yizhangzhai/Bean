@@ -30,24 +30,88 @@ class BinSpec:
     edges: list[np.ndarray]      # edges[f] = interior quantile cut values
     pct: np.ndarray              # (B-1,) percentile of each edge, e.g. .1,.2,...
     n_bins: int
+    active: list = None          # per-feature array of ACTIVE split-k indices
+                                 # (None => all thresholds active, as before)
+
+    def active_for(self, f):
+        return None if self.active is None else self.active[f]
 
 
-def fit_bins(X: np.ndarray, n_bins: int = 10) -> tuple[np.ndarray, BinSpec]:
+def _chimerge_active(xb, Y, B, chi2_thresh):
+    """Supervised threshold selection (ChiMerge, union across label types).
+
+    Merge adjacent fine bins whose per-type fraud rates are not statistically
+    distinguishable (chi-square < threshold for ALL types); the surviving bin
+    boundaries are the active split indices. Flat/degenerate ranges collapse to
+    nothing; cut points survive only where the label rate genuinely changes.
+    """
+    C = Y.shape[1]
+    counts = np.bincount(xb, minlength=B).astype(np.float64)
+    pos = [np.bincount(xb, weights=Y[:, c].astype(np.float64), minlength=B)
+           for c in range(C)]
+    segs = [[i, i, counts[i], [pos[c][i] for c in range(C)]] for i in range(B)]
+
+    def chi2(a, b):                                   # max chi2 over types (union)
+        na, nb = a[2], b[2]
+        N = na + nb
+        if N == 0:
+            return 0.0
+        best = 0.0
+        for c in range(C):
+            ap, bp = a[3][c], b[3][c]
+            c1 = ap + bp
+            c2 = N - c1
+            if na == 0 or nb == 0 or c1 == 0 or c2 == 0:
+                continue
+            v = 0.0
+            for o, r, cc in ((ap, na, c1), (na - ap, na, c2),
+                             (bp, nb, c1), (nb - bp, nb, c2)):
+                e = r * cc / N
+                if e > 0:
+                    v += (o - e) ** 2 / e
+            best = max(best, v)
+        return best
+
+    while len(segs) > 1:
+        chis = [chi2(segs[i], segs[i + 1]) for i in range(len(segs) - 1)]
+        mi = int(np.argmin(chis))
+        if chis[mi] >= chi2_thresh:
+            break
+        a, b = segs[mi], segs[mi + 1]
+        segs[mi] = [a[0], b[1], a[2] + b[2],
+                    [a[3][c] + b[3][c] for c in range(C)]]
+        del segs[mi + 1]
+    return np.array([segs[i][1] for i in range(len(segs) - 1)], dtype=np.int64)
+
+
+def fit_bins(X: np.ndarray, n_bins: int = 10, *, Y=None, supervised: bool = False,
+             chi2: float = 6.63) -> tuple[np.ndarray, BinSpec]:
     """Bin every feature by its training quantiles -> (Xbin int8, BinSpec).
 
     Bin index b means edges[b-1] <= x < edges[b]. Threshold split index k in
     0..B-2 corresponds to the cut at percentile (k+1)/n_bins.
+
+    If `supervised` and `Y` (N x C labels) are given, also compute a per-feature
+    ACTIVE threshold mask via chi-square-gated bin merging (ChiMerge): thresholds
+    in flat / uninformative ranges are dropped so the search never generates
+    them. Lossless for structure; for the label it keeps exactly the cut points
+    where the fraud rate changes (which, for conjunctions, are the boundaries
+    that matter -- see README). Compute on TRAIN only to avoid leakage.
     """
     n, f = X.shape
     qs = np.arange(1, n_bins) / n_bins
     Xbin = np.empty((n, f), dtype=np.int8)
     edges: list[np.ndarray] = []
+    active = [] if (supervised and Y is not None) else None
     for j in range(f):
         col = X[:, j]
         e = np.quantile(col, qs)
         edges.append(e.astype(np.float64))
-        Xbin[:, j] = np.searchsorted(e, col, side="right").astype(np.int8)
-    return Xbin, BinSpec(edges, qs, n_bins)
+        xb = np.searchsorted(e, col, side="right").astype(np.int8)
+        Xbin[:, j] = xb
+        if active is not None:
+            active.append(_chimerge_active(xb, Y, n_bins, chi2))
+    return Xbin, BinSpec(edges, qs, n_bins, active)
 
 
 @dataclass
@@ -84,10 +148,11 @@ def rule_mask(preds, Xbin) -> np.ndarray:
     return m
 
 
-def _hist_scores(xb, Yw, base, n_bins, min_support, n_for_base):
+def _hist_scores(xb, Yw, base, n_bins, min_support, n_for_base, active=None):
     """Return candidate (op, k, support, lift[C]) for one feature's bin column.
 
     xb: int8 bin indices (subset or full). Yw: (len(xb), C) weights.
+    `active`: optional array of split indices k to consider (else all 0..B-2).
     """
     B = n_bins
     counts = np.bincount(xb, minlength=B).astype(np.float64)      # per bin
@@ -100,7 +165,8 @@ def _hist_scores(xb, Yw, base, n_bins, min_support, n_for_base):
     total_w = wc[-1]
     N = xb.shape[0]
     out = []
-    for k in range(B - 1):
+    ks = range(B - 1) if active is None else active
+    for k in ks:
         s_below, c_below = cc[k], wc[k]
         s_above, c_above = N - cc[k], total_w - wc[k]
         for op, s, cgt in (("<", s_below, c_below), (">", s_above, c_above)):
@@ -133,7 +199,10 @@ def fast_beam_search(
     cands: list[FastRule] = []
     tick = max(1, F // 5)
     for f in range(F):
-        for op, k, s, lift in _hist_scores(Xbin[:, f], Yw, base, nb, min_support, N):
+        af = spec.active_for(f)
+        if af is not None and len(af) == 0:
+            continue
+        for op, k, s, lift in _hist_scores(Xbin[:, f], Yw, base, nb, min_support, N, af):
             cands.append(FastRule(((f, op, k),), s, lift * base, lift,
                                   float(objective(lift))))
         if prog.enabled and (f + 1) % tick == 0:
@@ -157,9 +226,12 @@ def fast_beam_search(
             subYw = Yw[idx]
             used = r.features_ops()
             for f in range(F):
+                af = spec.active_for(f)
+                if af is not None and len(af) == 0:
+                    continue
                 xb = Xbin[idx, f]
                 for op, k, s, lift in _hist_scores(xb, subYw, base, nb,
-                                                   min_support, N):
+                                                   min_support, N, af):
                     if (f, op) in used:
                         continue
                     explored += 1
