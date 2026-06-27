@@ -81,7 +81,8 @@ def make(n, n_features, seed):
     return X, Y, planted
 
 
-def run(n=200_000, n_features=100, bins=16, max_depth=10, beam=24, seed=0):
+def run(n=200_000, n_features=100, bins=16, max_depth=10, beam=24, seed=0,
+        progress=False):
     t = time.perf_counter()
     X, Y, planted = make(n, n_features, seed)
     t_gen = time.perf_counter() - t
@@ -109,10 +110,12 @@ def run(n=200_000, n_features=100, bins=16, max_depth=10, beam=24, seed=0):
     t = time.perf_counter()
     summary = []
     for c, pat in enumerate(DEEP):
+        from arp.progress import Progress
+        prog = Progress(enabled=progress, label=f"deep10[{pat['name']}]")
         rules, trace = targeted_beam_search(
             Xtr, Ytr, c, spec, min_recall=0.20, target_precision=0.5,
             min_support=40, beam_width=beam, max_depth=max_depth,
-            Xbin_val=Xva, Y_val=Yva, gap_tol=0.25, max_accept=1500)
+            Xbin_val=Xva, Y_val=Yva, gap_tol=0.25, max_accept=1500, progress=prog)
         plant = planted[c]
         if not rules:
             summary.append((pat["name"], "MISS"))
@@ -149,5 +152,6 @@ if __name__ == "__main__":
     ap.add_argument("--bins", type=int, default=16)
     ap.add_argument("--max-depth", type=int, default=10)
     ap.add_argument("--beam", type=int, default=24)
+    ap.add_argument("--progress", action="store_true", help="live per-depth progress")
     a = ap.parse_args()
-    run(a.n, a.features, a.bins, a.max_depth, a.beam)
+    run(a.n, a.features, a.bins, a.max_depth, a.beam, progress=a.progress)

@@ -226,7 +226,26 @@ rules, pruned = mixed_targeted_search(
     M_val=M_val, y_val=y_val, gap_tol=0.2, policy=policy)
 ```
 
-### 5.5 Dollar-weighting & portfolio
+### 5.5 Live progress
+
+Pass `progress=True` (or a `Progress` instance) to any miner — `fast_beam_search`,
+`targeted_beam_search`, `mixed_targeted_search` — for a per-depth view on stderr:
+paths explored, prunes, the growing rule collection, best precision/recall, and
+elapsed time. Watch a depth-10 search climb:
+
+```
+┌─ targeted[deep10_chain]: F=100  beam=24  max_depth=10  targets=P>=0.5 R>=0.2 gap<=0.25
+│  depth 1  beam   1→ 24  explored    3,000  accept +0 (Σ0)     prune recall=595 gap=0     bestP=0.01 R=1.00  0.1s
+│  depth 8  beam  24→ 24  explored   63,223  accept +0 (Σ0)     prune recall=57,371 gap=0  bestP=0.38 R=0.27  2.0s
+│  depth 9  beam  24→ 24  explored   57,266  accept +147 (Σ147) prune recall=53,507 gap=0  bestP=0.63 R=0.27  2.2s
+│  depth 10 beam  24→ 24  explored   53,069  accept +1353 (Σ1500) prune recall=49,169 gap=0 bestP=0.80 R=0.27  3.3s
+└─ done  1426 rules (of 1484 pre-minimality)  Σprune recall=490,552 gap=0  10 depths  3.4s
+```
+
+The `fast` (lift) miner also emits feature-scan ticks during the depth-1 sweep —
+useful on the long 2M × 1000 runs. Try it: `python3 experiments/deep10.py --progress`.
+
+### 5.6 Dollar-weighting & portfolio
 
 ```python
 from arp import build_portfolio
@@ -308,6 +327,7 @@ arp/
                  mutually-exclusive / required-with / categorical eq-set caps /
                  soft discouraged pairs
   mixed.py       numeric + categorical predicates; honors RulePolicy
+  progress.py    opt-in per-depth progress reporter (paths/prunes/collection/P-R)
   portfolio.py   greedy maximin type-balanced rule portfolio
   baselines.py   sklearn decision-tree comparison
   demo.py        end-to-end runnable demo

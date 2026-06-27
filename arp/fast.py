@@ -121,24 +121,36 @@ def fast_beam_search(
     max_depth: int = 3,
     min_support: int = 40,
     min_gain: float = 0.10,
+    progress=None,
 ) -> list[FastRule]:
+    from .progress import make_progress
     N, F = Xbin.shape
     nb = spec.n_bins
+    prog = make_progress(progress, "fast")
+    prog.start(N=f"{N:,}", F=F, beam=beam_width, max_depth=max_depth)
 
     # ---- depth 1: histogram scan over every feature ----
     cands: list[FastRule] = []
+    tick = max(1, F // 5)
     for f in range(F):
         for op, k, s, lift in _hist_scores(Xbin[:, f], Yw, base, nb, min_support, N):
             cands.append(FastRule(((f, op, k),), s, lift * base, lift,
                                   float(objective(lift))))
+        if prog.enabled and (f + 1) % tick == 0:
+            prog.tick(f"depth-1 scan {f + 1:,}/{F:,} features  "
+                      f"({len(cands):,} candidates)  {prog.elapsed():.1f}s")
     cands.sort(key=lambda r: r.value, reverse=True)
     beam = cands[:beam_width]
     for r in beam:
         r.mask = rule_mask(r.preds, Xbin)
     pool = {r.key(): r for r in beam}
+    prog.depth(1, beam_in=1, beam_out=len(beam), explored=len(cands),
+               accepted_total=len(pool),
+               best_p=beam[0].value if beam else 0.0, best_r=None)
 
     # ---- grow via subset rescan ----
     for _depth in range(2, max_depth + 1):
+        explored = 0
         nxt: list[FastRule] = []
         for r in beam:
             idx = np.flatnonzero(r.mask)
@@ -150,6 +162,7 @@ def fast_beam_search(
                                                    min_support, N):
                     if (f, op) in used:
                         continue
+                    explored += 1
                     val = float(objective(lift))
                     if val <= r.value * (1.0 + min_gain):
                         continue
@@ -163,10 +176,16 @@ def fast_beam_search(
             kkey = r.key()
             if kkey not in best or r.value > best[kkey].value:
                 best[kkey] = r
+        beam_in = len(beam)
         beam = sorted(best.values(), key=lambda r: r.value, reverse=True)[:beam_width]
         for r in beam:
             r.mask = rule_mask(r.preds, Xbin)
             if r.key() not in pool or r.value > pool[r.key()].value:
                 pool[r.key()] = r
+        prog.depth(_depth, beam_in=beam_in, beam_out=len(beam), explored=explored,
+                   accepted_total=len(pool),
+                   best_p=beam[0].value if beam else 0.0, best_r=None)
 
-    return sorted(pool.values(), key=lambda r: r.value, reverse=True)
+    out = sorted(pool.values(), key=lambda r: r.value, reverse=True)
+    prog.done(rules=len(out), note=f"top score={out[0].value:.1f}" if out else "")
+    return out

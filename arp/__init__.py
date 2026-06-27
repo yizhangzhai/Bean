@@ -27,6 +27,7 @@ from .bitset import coarse_to_fine_mine, bitset_beam_search
 from .targeted import TargetedRule, targeted_beam_search
 from .constraints import FeatureConstraint, RulePolicy
 from .mixed import Meta, MixedRule, mixed_targeted_search
+from .progress import Progress
 
 __all__ = [
     # data
@@ -46,4 +47,6 @@ __all__ = [
     "FeatureConstraint", "RulePolicy",
     # mixed numeric + categorical
     "Meta", "MixedRule", "mixed_targeted_search",
+    # progress reporting
+    "Progress",
 ]

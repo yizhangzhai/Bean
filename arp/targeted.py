@@ -28,6 +28,8 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
+from .progress import make_progress
+
 
 @dataclass
 class TargetedRule:
@@ -99,6 +101,7 @@ def targeted_beam_search(
     Xbin_val=None, Y_val=None, gap_tol=None,
     max_accept=2000,
     policy=None,
+    progress=None,
 ):
     """Grow rules toward (precision >= target, recall >= floor); return accepted.
 
@@ -173,13 +176,27 @@ def targeted_beam_search(
         return beam
 
     nb = spec.n_bins
+    prog = make_progress(progress, f"targeted[{target}]")
+    prog.start(F=F, beam=beam_width, max_depth=max_depth,
+               targets=f"P>={target_precision} R>={min_recall} gap<={gap_tol}")
+
+    def _report(d, beam_in, beam_out, explored, pr0):
+        pool = beam_out + (acc_c if isinstance(acc_c, list) else [])
+        bp, br = (max((r.precision for r in pool), default=0.0),
+                  max((r.recall for r in pool), default=0.0))
+        prog.depth(d, beam_in=beam_in, beam_out=len(beam_out), explored=explored,
+                   accepted_new=len(accepted) - pr0[2], accepted_total=len(accepted),
+                   prune_recall=pruned["recall<floor"] - pr0[0],
+                   prune_gap=pruned["train/val gap"] - pr0[1], best_p=bp, best_r=br)
 
     # ---- depth 1 ----
-    acc_c, grow_c = [], []
+    pr0 = (pruned["recall<floor"], pruned["train/val gap"], len(accepted))
+    acc_c, grow_c, explored = [], [], 0
     for f in range(F):
         for op, k, s, tp in _hist_tp(Xbin[:, f], yc, nb, min_support):
             if policy is not None and not policy.pred_ok(f, op, k, nb):
                 continue
+            explored += 1
             r = make_rule([(f, op, k)], s, tp, 1)
             a = triage_train(r)
             if a == "prune":
@@ -189,9 +206,12 @@ def targeted_beam_search(
             else:
                 grow_c.append(r)
     beam = settle(acc_c, grow_c)
+    _report(1, 1, beam, explored, pr0)
 
     # ---- grow ----
     for depth in range(2, max_depth + 1):
+        pr0 = (pruned["recall<floor"], pruned["train/val gap"], len(accepted))
+        beam_in, explored = len(beam), 0
         acc_c, grow_c, seen = [], {}, set()
         for r in beam:
             idx = np.flatnonzero(r.mask)
@@ -207,6 +227,7 @@ def targeted_beam_search(
                             not policy.pred_ok(f, op, k, nb)
                             or not policy.extend_ok(rfeats, f, op)):
                         continue
+                    explored += 1
                     nr = make_rule(r.preds + ((f, op, k),), s, tp, depth)
                     a = triage_train(nr)
                     if a == "prune":
@@ -221,6 +242,7 @@ def targeted_beam_search(
         if not acc_c and not grow_c:
             break
         beam = settle(acc_c, list(grow_c.values()))
+        _report(depth, beam_in, beam, explored, pr0)
         if (not beam and not acc_c) or len(accepted) >= max_accept:
             break
 
@@ -246,4 +268,7 @@ def targeted_beam_search(
     trace.append(f"accepted={len(out)} (of {len(uniq)} pre-minimality)  "
                  f"pruned: recall_floor={pruned['recall<floor']}  "
                  f"val_gap={pruned['train/val gap']}")
+    prog.done(rules=len(out), prune_recall=pruned["recall<floor"],
+              prune_gap=pruned["train/val gap"],
+              note=f"(of {len(uniq)} pre-minimality)")
     return out, trace

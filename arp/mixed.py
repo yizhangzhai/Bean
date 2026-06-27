@@ -169,7 +169,8 @@ def _mask(preds, M):
 def mixed_targeted_search(M, y, meta, *, min_recall=0.25, target_precision=0.5,
                           min_support=40, beam_width=12, max_depth=6,
                           M_val=None, y_val=None, gap_tol=0.20, max_accept=2000,
-                          policy=None):
+                          policy=None, progress=None):
+    from .progress import make_progress
     N, F = M.shape
     total = float(y.sum())
     have_val = M_val is not None and y_val is not None
@@ -222,10 +223,25 @@ def mixed_targeted_search(M, y, meta, *, min_recall=0.25, target_precision=0.5,
             return "prune"
         return "accept" if r.precision >= target_precision else "grow"
 
+    prog = make_progress(progress, "mixed")
+    prog.start(F=F, beam=beam_width, max_depth=max_depth,
+               targets=f"P>={target_precision} R>={min_recall} gap<={gap_tol}")
+
+    def _report(d, beam_in, beam_out, explored, pr0):
+        pool = beam_out + acc_c
+        prog.depth(d, beam_in=beam_in, beam_out=len(beam_out), explored=explored,
+                   accepted_new=len(accepted) - pr0[2], accepted_total=len(accepted),
+                   prune_recall=pruned["recall"] - pr0[0],
+                   prune_gap=pruned["gap"] - pr0[1],
+                   best_p=max((r.precision for r in pool), default=0.0),
+                   best_r=max((r.recall for r in pool), default=0.0))
+
     # depth 1
-    acc_c, grow_c = [], []
+    pr0 = (pruned["recall"], pruned["gap"], len(accepted))
+    acc_c, grow_c, explored = [], [], 0
     for f in range(F):
         for pred, s, tp in feature_cands(f, M[:, f], y, meta, min_support, base, policy):
+            explored += 1
             r = make([pred], s, tp, 1)
             a = triage(r)
             if a == "prune":
@@ -235,9 +251,12 @@ def mixed_targeted_search(M, y, meta, *, min_recall=0.25, target_precision=0.5,
             else:
                 grow_c.append(r)
     beam = settle(acc_c, grow_c)
+    _report(1, 1, beam, explored, pr0)
 
     # grow
     for depth in range(2, max_depth + 1):
+        pr0 = (pruned["recall"], pruned["gap"], len(accepted))
+        beam_in, explored = len(beam), 0
         acc_c, grow_d = [], {}
         for r in beam:
             idx = np.flatnonzero(r.mask)
@@ -253,6 +272,7 @@ def mixed_targeted_search(M, y, meta, *, min_recall=0.25, target_precision=0.5,
                 for pred, s, tp in feature_cands(f, col, sub_y, meta, min_support, base, policy):
                     if pred.fkey() in used:
                         continue
+                    explored += 1
                     nr = make(r.preds + (pred,), s, tp, depth)
                     a = triage(nr)
                     if a == "prune":
@@ -266,6 +286,7 @@ def mixed_targeted_search(M, y, meta, *, min_recall=0.25, target_precision=0.5,
         if not acc_c and not grow_d:
             break
         beam = settle(acc_c, list(grow_d.values()))
+        _report(depth, beam_in, beam, explored, pr0)
         if (not beam and not acc_c) or len(accepted) >= max_accept:
             break
 
@@ -284,4 +305,6 @@ def mixed_targeted_search(M, y, meta, *, min_recall=0.25, target_precision=0.5,
         kept.append(r)
         ksets.append(fs)
     out = sorted(kept, key=lambda r: (r.recall, r.precision), reverse=True)
+    prog.done(rules=len(out), prune_recall=pruned["recall"], prune_gap=pruned["gap"],
+              note=f"(of {len(uniq)} pre-minimality)")
     return out, pruned
