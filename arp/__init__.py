@@ -23,6 +23,8 @@ from .search import Rule, beam_search, evaluate_rule, refine_rule
 from .portfolio import Portfolio, build_portfolio
 # scalable + practical layers
 from .fast import BinSpec, FastRule, fit_bins, fast_beam_search
+from .encode import (quantile_edges, assign_bins, encode_split_cm,
+                     encode_matrix_cm, encode_matrix_naive)
 from .bitset import coarse_to_fine_mine, bitset_beam_search
 from .targeted import TargetedRule, targeted_beam_search
 from .constraints import FeatureConstraint, RulePolicy
@@ -44,6 +46,9 @@ __all__ = [
     # scalable miner
     "BinSpec", "FastRule", "fit_bins", "fast_beam_search",
     "coarse_to_fine_mine", "bitset_beam_search",
+    # fast encoding (sampled edges + column-major + threaded)
+    "quantile_edges", "assign_bins", "encode_split_cm",
+    "encode_matrix_cm", "encode_matrix_naive",
     # targeted (precision/recall) + constraints
     "TargetedRule", "targeted_beam_search",
     "FeatureConstraint", "RulePolicy",
