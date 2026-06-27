@@ -153,8 +153,13 @@ def targeted_beam_search(
             else:
                 r.stop_reason = "precision target met"
                 accepted.append(r)
-        # rank grow candidates on train precision, gap-check only the top beam
-        grow_cands.sort(key=lambda r: (r.precision, r.recall), reverse=True)
+        # rank grow candidates on train precision (minus a soft penalty for
+        # discouraged feature co-occurrence), gap-check only the top beam
+        def rkey(r):
+            pen = (policy.rule_penalty({f for f, _, _ in r.preds})
+                   if policy is not None else 0.0)
+            return (r.precision - pen, r.recall)
+        grow_cands.sort(key=rkey, reverse=True)
         beam = []
         for r in grow_cands:
             if len(beam) >= beam_width:

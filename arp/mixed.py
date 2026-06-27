@@ -119,10 +119,23 @@ def cat_cands(f, col, y, card, min_support, base, alpha=20.0,
     return out
 
 
-def feature_cands(f, col, y, meta, min_support, base):
+def feature_cands(f, col, y, meta, min_support, base, policy=None):
     if meta.kind[f] == "num":
-        return num_cands(f, col, y, meta.size[f], min_support)
-    return cat_cands(f, col, y, meta.size[f], min_support, base)
+        cands = num_cands(f, col, y, meta.size[f], min_support)
+        if policy is None:
+            return cands
+        return [(p, s, tp) for p, s, tp in cands
+                if policy.pred_ok(p.f, p.op, p.k, meta.size[f])]
+    cands = cat_cands(f, col, y, meta.size[f], min_support, base)
+    if policy is None:
+        return cands
+    out = []
+    for p, s, tp in cands:
+        kind = "eq" if isinstance(p, EqPred) else "in"
+        codes = (p.code,) if kind == "eq" else p.codes
+        if policy.cat_pred_ok(p.f, kind, codes):
+            out.append((p, s, tp))
+    return out
 
 
 # ---------------- rule + mixed targeted search ----------------
@@ -155,7 +168,8 @@ def _mask(preds, M):
 
 def mixed_targeted_search(M, y, meta, *, min_recall=0.25, target_precision=0.5,
                           min_support=40, beam_width=12, max_depth=6,
-                          M_val=None, y_val=None, gap_tol=0.20, max_accept=2000):
+                          M_val=None, y_val=None, gap_tol=0.20, max_accept=2000,
+                          policy=None):
     N, F = M.shape
     total = float(y.sum())
     have_val = M_val is not None and y_val is not None
@@ -186,7 +200,11 @@ def mixed_targeted_search(M, y, meta, *, min_recall=0.25, target_precision=0.5,
                 pruned["gap"] += 1
             else:
                 accepted.append(r)
-        grow_c.sort(key=lambda r: (r.precision, r.recall), reverse=True)
+        # soft penalty: deprioritize discouraged feature co-occurrence on ties
+        def rkey(r):
+            pen = policy.rule_penalty({p.f for p in r.preds}) if policy else 0.0
+            return (r.precision - pen, r.recall)
+        grow_c.sort(key=rkey, reverse=True)
         beam = []
         for r in grow_c:
             if len(beam) >= beam_width:
@@ -207,7 +225,7 @@ def mixed_targeted_search(M, y, meta, *, min_recall=0.25, target_precision=0.5,
     # depth 1
     acc_c, grow_c = [], []
     for f in range(F):
-        for pred, s, tp in feature_cands(f, M[:, f], y, meta, min_support, base):
+        for pred, s, tp in feature_cands(f, M[:, f], y, meta, min_support, base, policy):
             r = make([pred], s, tp, 1)
             a = triage(r)
             if a == "prune":
@@ -225,11 +243,14 @@ def mixed_targeted_search(M, y, meta, *, min_recall=0.25, target_precision=0.5,
             idx = np.flatnonzero(r.mask)
             sub_y = y[idx]
             used = r.fkeys()
+            rfeats = {fk[0] for fk in used}
             for f in range(F):
                 if any(fk[0] == f for fk in used) and meta.kind[f] == "cat":
                     continue                       # one predicate per cat feature
+                if policy is not None and not policy.extend_ok(rfeats, f, None):
+                    continue                       # forbidden pair / mutual-excl
                 col = M[idx, f]
-                for pred, s, tp in feature_cands(f, col, sub_y, meta, min_support, base):
+                for pred, s, tp in feature_cands(f, col, sub_y, meta, min_support, base, policy):
                     if pred.fkey() in used:
                         continue
                     nr = make(r.preds + (pred,), s, tp, depth)
@@ -255,6 +276,8 @@ def mixed_targeted_search(M, y, meta, *, min_recall=0.25, target_precision=0.5,
             uniq[r.key()] = r
     kept, ksets = [], []
     for r in sorted(uniq.values(), key=lambda r: (len(r.preds), -r.precision)):
+        if policy is not None and not policy.rule_ok({p.f for p in r.preds}):
+            continue                              # required-with not satisfied
         fs = frozenset(r.preds)
         if any(ks <= fs for ks in ksets):
             continue

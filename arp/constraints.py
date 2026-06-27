@@ -36,9 +36,14 @@ from dataclasses import dataclass, field
 @dataclass(frozen=True)
 class FeatureConstraint:
     allowed: bool = True
+    # --- numeric ---
     directions: tuple = (">", "<")
     two_way: bool = True
     pct_range: tuple = (0.0, 1.0)
+    # --- categorical ---
+    cat_kinds: tuple = ("eq", "in")     # allowed predicate kinds
+    max_set_size: int = 10 ** 9         # cap on `in {...}` size (interpretability)
+    allowed_levels: frozenset = None    # None = any level usable
 
 
 @dataclass
@@ -60,6 +65,27 @@ class RulePolicy:
             return False
         pct = (k + 1) / n_bins
         return c.pct_range[0] <= pct <= c.pct_range[1] + 1e-9
+
+    # ---- candidate generation: is this categorical predicate allowed? ----
+    def cat_pred_ok(self, f, kind, codes) -> bool:
+        c = self.fc(f)
+        if not c.allowed or kind not in c.cat_kinds:
+            return False
+        if kind == "in" and len(codes) > c.max_set_size:
+            return False
+        if c.allowed_levels is not None and not set(codes) <= c.allowed_levels:
+            return False
+        return True
+
+    # ---- soft ranking penalty for discouraged co-occurrence within a rule ----
+    def rule_penalty(self, feats) -> float:
+        fl = list(feats)
+        pen = 0.0
+        for i in range(len(fl)):
+            for j in range(i + 1, len(fl)):
+                if frozenset((fl[i], fl[j])) in self.discouraged_pairs:
+                    pen += 0.05
+        return pen
 
     # ---- expansion: may we add feature f (op) to a rule using rule_feats? ----
     def extend_ok(self, rule_feats, f, op) -> bool:
@@ -91,7 +117,9 @@ class RulePolicy:
     @staticmethod
     def build(*, monotone_up=(), monotone_down=(), one_way=(),
               ranges=None, disable=(), forbidden_pairs=(),
-              discouraged_pairs=(), mutually_exclusive=(), required_with=None):
+              discouraged_pairs=(), mutually_exclusive=(), required_with=None,
+              cat_eq_only=(), cat_set_only=(), max_set_size=None,
+              allowed_levels=None):
         pf: dict = {}
 
         def upd(f, **kw):
@@ -100,7 +128,10 @@ class RulePolicy:
                 allowed=kw.get("allowed", cur.allowed),
                 directions=kw.get("directions", cur.directions),
                 two_way=kw.get("two_way", cur.two_way),
-                pct_range=kw.get("pct_range", cur.pct_range))
+                pct_range=kw.get("pct_range", cur.pct_range),
+                cat_kinds=kw.get("cat_kinds", cur.cat_kinds),
+                max_set_size=kw.get("max_set_size", cur.max_set_size),
+                allowed_levels=kw.get("allowed_levels", cur.allowed_levels))
 
         for f in monotone_up:
             upd(f, directions=(">",), two_way=False)
@@ -112,6 +143,14 @@ class RulePolicy:
             upd(f, allowed=False)
         for f, rng in (ranges or {}).items():
             upd(f, pct_range=rng)
+        for f in cat_eq_only:
+            upd(f, cat_kinds=("eq",))
+        for f in cat_set_only:
+            upd(f, cat_kinds=("in",))
+        for f, sz in (max_set_size or {}).items():
+            upd(f, max_set_size=sz)
+        for f, lv in (allowed_levels or {}).items():
+            upd(f, allowed_levels=frozenset(lv))
         return RulePolicy(
             per_feature=pf,
             forbidden_pairs={frozenset(p) for p in forbidden_pairs},
