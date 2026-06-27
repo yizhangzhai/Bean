@@ -327,6 +327,8 @@ arp/
                  mutually-exclusive / required-with / categorical eq-set caps /
                  soft discouraged pairs
   mixed.py       numeric + categorical predicates; honors RulePolicy
+  gapfill.py     gap-driven feature engineering: find uncovered positives,
+                 diagnose geometry (topology-lite ring/void), synthesize features
   progress.py    opt-in per-depth progress reporter (paths/prunes/collection/P-R)
   portfolio.py   greedy maximin type-balanced rule portfolio
   baselines.py   sklearn decision-tree comparison
@@ -340,6 +342,25 @@ tests/           correctness (label-as-query identity, GT recovery, portfolio, r
 Run any study with `PYTHONPATH=. python3 experiments/<name>.py`.
 
 ---
+
+## 8b. Gap-driven feature engineering (`gapfill.py`)
+
+Axis-aligned rules can't cover a fraud signal that lives on a non-axis structure
+(a ring, a ratio ridge). The gap-fill loop closes that:
+
+1. **gap** = positives covered by no rule (the residual).
+2. **diagnose geometry** — a topology-lite signal detects whether the residual
+   forms a ring / void (an H₁-like hole), which means "use a radial coordinate."
+   (A rigorous version would use persistent homology via ripser/gudhi.)
+3. **synthesize & rank** features (radial / ratio / diff) by how well a single
+   band on them isolates the residual; add the winner and re-mine.
+
+Validated (`experiments/gapfill.py`): one label fired by an axis pattern **or** a
+ring `2 < dist((f0,f1),(10,10)) < 4`. The base miner covers only the axis frauds
+(recall **0.34**); the gap (71% of frauds, the ring) is diagnosed, the radial
+feature is synthesized — recovering the center `(10.1, 9.9)` at **lift 10.3** (4×
+the next candidate) — and after re-mining, coverage rises to **0.73**. This is
+the documented antidote to "axis-aligned rules can't express the right geometry."
 
 ## 9. Roadmap
 
