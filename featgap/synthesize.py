@@ -1,34 +1,20 @@
-"""Gap-driven feature engineering.
+"""featgap.synthesize -- candidate feature construction for the gap.
 
-After mining, some positives are covered by no rule -- the *gap*. Because the
-miner only cuts axes, a fraud signal living on a non-axis-aligned structure (a
-ring, a ratio ridge, a periodic band) is uncoverable until the right feature is
-built. This module:
+Given the residual (uncovered positives), diagnose its geometry and synthesize
+features that separate it:
 
-  1. finds the gap            -- uncovered positives
-  2. diagnoses its geometry   -- a topology-lite signal: do the residual
-                                 positives form a ring / void (an H1-like hole)?
-                                 That hole == "use a radial/distance coordinate".
-  3. synthesizes & ranks      -- candidate engineered features (radial, ratio,
-     features that separate      diff, product), scored by how well a single
-     the residual                band on them isolates the residual positives.
+  * topology-lite ring/void detector (an H1-like hole == "use a radial coord")
+  * candidate transforms (radial / ratio / diff) ranked by how well a single
+    band on them isolates the residual positives.
 
 The topology step is a lightweight stand-in for persistent homology (ripser /
 gudhi give the rigorous H1); here a center-vs-shell density test detects the
-same ring signature with no extra dependency.
+ring signature with no extra dependency.
 """
 
 from __future__ import annotations
 
 import numpy as np
-
-
-def uncovered_positives(rule_masks, y):
-    """Return (gap_mask, covered_mask): positives matched by no rule."""
-    covered = np.zeros(len(y), dtype=bool)
-    for m in rule_masks:
-        covered |= m
-    return (y == 1) & ~covered, covered
 
 
 def best_band(v, lbl, n_bins=24, min_support=30, min_recall=0.25):

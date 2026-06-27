@@ -327,15 +327,19 @@ arp/
                  mutually-exclusive / required-with / categorical eq-set caps /
                  soft discouraged pairs
   mixed.py       numeric + categorical predicates; honors RulePolicy
-  gapfill.py     gap-driven feature engineering: find uncovered positives,
-                 diagnose geometry (topology-lite ring/void), synthesize features
   progress.py    opt-in per-depth progress reporter (paths/prunes/collection/P-R)
   portfolio.py   greedy maximin type-balanced rule portfolio
   baselines.py   sklearn decision-tree comparison
   demo.py        end-to-end runnable demo
+featgap/         SEPARATE feature-engineering layer (depends on arp, not vice
+                 versa) -- see section 8b
+  gap.py         uncovered positives + residual re-mine diagnostic (step 1)
+  screen.py      interaction-information + HSIC interaction screens (step 3)
+  synthesize.py  topology-lite geometry diagnosis + feature synthesis
 experiments/     reproducible studies (see experiments/README.md)
   recovery, scale, scale_fused, bitset_bench, targeted, hard_recovery,
-  hard_scale, deep10, intervals, mixed_recovery, constrained, constrained_cat
+  hard_scale, deep10, intervals, mixed_recovery, constrained, constrained_cat,
+  featgap_triage
 tests/           correctness (label-as-query identity, GT recovery, portfolio, refine)
 ```
 
@@ -343,24 +347,39 @@ Run any study with `PYTHONPATH=. python3 experiments/<name>.py`.
 
 ---
 
-## 8b. Gap-driven feature engineering (`gapfill.py`)
+## 8b. Gap-driven feature engineering — the separate `featgap` package
 
 Axis-aligned rules can't cover a fraud signal that lives on a non-axis structure
-(a ring, a ratio ridge). The gap-fill loop closes that:
+(a ring, a ratio ridge, an interaction). Filling that gap is **feature
+engineering, not rule mining**, so it lives in its own package with a
+one-directional dependency (`featgap → arp`). It runs **after** search, on the
+residual — the gap is only well-defined relative to what the rules already cover,
+and the residual is *purified* (the easy axis signal is gone), which sharpens the
+diagnosis.
 
-1. **gap** = positives covered by no rule (the residual).
-2. **diagnose geometry** — a topology-lite signal detects whether the residual
-   forms a ring / void (an H₁-like hole), which means "use a radial coordinate."
-   (A rigorous version would use persistent homology via ripser/gudhi.)
-3. **synthesize & rank** features (radial / ratio / diff) by how well a single
-   band on them isolates the residual; add the winner and re-mine.
+A cheap-to-fancy **triage** identifies the gap before any feature is built:
 
-Validated (`experiments/gapfill.py`): one label fired by an axis pattern **or** a
-ring `2 < dist((f0,f1),(10,10)) < 4`. The base miner covers only the axis frauds
-(recall **0.34**); the gap (71% of frauds, the ring) is diagnosed, the radial
-feature is synthesized — recovering the center `(10.1, 9.9)` at **lift 10.3** (4×
-the next candidate) — and after re-mining, coverage rises to **0.73**. This is
-the documented antidote to "axis-aligned rules can't express the right geometry."
+1. **`remine_residual`** (step 1, free): re-mine the residual with the same
+   engine. A single axis rule recovers it → *greedy myopia* (widen/deepen the
+   search). It can't → *non-axis gap* (engineer).
+2. **`interaction_screen`** (step 3): rank feature **pairs** by interaction
+   information `MI(y;i,j) − MI(y;i) − MI(y;j)`; **`hsic`** (kernel dependence)
+   confirms. Catches interactions with little marginal signal — and the HSIC
+   here is literally the dependence measure this project *opened* with.
+3. **`propose_features`**: topology-lite geometry diagnosis (ring/void → radial)
+   ranks candidate transforms (radial / ratio / diff) by residual separability.
+4. Add the winner, **re-mine**.
+
+Validated (`experiments/featgap_triage.py`): one label fired by an axis pattern
+**or** a ring `2 < dist((f0,f1),(10,10)) < 4`. The base miner covers only the
+axis frauds (recall **0.34**). Triage: step 1 reports the best single axis rule
+reaches only R≈0.17 → *non-axis*; step 3 flags `(f0,f1)` as the interaction
+(joint MI 0.12 ≫ marginals 0.05); synthesis recovers the ring center `(10.1,9.9)`
+at **lift 10.3**; re-mining lifts coverage to **0.73**.
+
+> Other gap-ID methods (and when to prefer them) are catalogued in the triage:
+> residual re-mine and interaction screens resolve most gaps cheaply; topology
+> earns its keep only for genuine hole/loop structure.
 
 ## 9. Roadmap
 

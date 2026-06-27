@@ -28,7 +28,8 @@ from .targeted import TargetedRule, targeted_beam_search
 from .constraints import FeatureConstraint, RulePolicy
 from .mixed import Meta, MixedRule, mixed_targeted_search
 from .progress import Progress
-from .gapfill import uncovered_positives, ring_score, best_band, propose_features
+# NOTE: gap-driven feature engineering lives in the separate `featgap` package
+# (one-directional dependency featgap -> arp), not in the core miner.
 
 __all__ = [
     # data
@@ -50,6 +51,4 @@ __all__ = [
     "Meta", "MixedRule", "mixed_targeted_search",
     # progress reporting
     "Progress",
-    # gap-driven feature engineering
-    "uncovered_positives", "ring_score", "best_band", "propose_features",
 ]
