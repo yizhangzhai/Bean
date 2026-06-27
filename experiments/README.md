@@ -143,3 +143,65 @@ the true signature depth; and the val-gap correctly **refuses** to emit
 `account_takeover` — whose true `f1>p95` cut is inexpressible at decile bins, so
 every path that hits P=0.5 overfits. The honest fix is finer bins (coarse-to-fine
 refinement), not a looser guard.
+
+## Hard patterns: deep / disjunctive / banded / adversarial (`arp.hard_data`, `experiments/hard_recovery.py`)
+
+Six planted patterns of varied difficulty (depth 3–6, conjunctive / disjunctive
+/ narrow-band / heavy-tailed, plus a gated-XOR adversary), with correlated decoy
+features. Mined with the recall-aware targeted search; recovery scored by
+**per-branch clean coverage** (is each DNF disjunct covered by a rule using only
+that branch's true features?).
+
+200K × 200, depth≤6, beam=16, ~10s / 0.57 GB:
+
+| pattern | depth | branches recovered | best valP/valR | verdict |
+|---|---|---|---|---|
+| deep5_chain | 5 | 1/1 clean | 0.79 / 0.48 | ✅ |
+| narrow_multiband | 3 bands | 1/1 clean | 0.62 / 0.57 | ✅ |
+| deep6 | 6 | 1/1 clean | 0.58 / 0.50 | ✅ |
+| heavy_tailed | 4 | 1/1 clean | 0.74 / 0.71 | ✅ |
+| disjunctive | 3 (×2) | **1/2** | 0.49 / 0.41 | ⚠️ one branch |
+| xor_gated | 3 | **0/2** | 0.44 / 0.28 | ❌ gate found, interaction missed |
+
+**4 full, 1 partial, 1 miss.** Honest limitations exposed:
+- **XOR / pure interactions** are missed — neither half of `f14⊕f15` has marginal
+  signal, so greedy beam can't seed it (it finds the gate `f26` + noise instead).
+  This is the known failure mode of greedy rule/tree methods; pairwise
+  interaction seeding would be needed.
+- **Disjunctions** recover only the strongest branch; the fix is sequential
+  covering (remove covered positives, re-mine) — currently noted, not built.
+- **Over-generation**: a strong pattern yields thousands of near-duplicate rules;
+  controlled by a minimality filter + `max_accept` cap (heavy_tailed 11k→<2k).
+- **No decoy ever entered a clean best rule** — false-discovery control held.
+
+Same battery at **1M × 500** (depth≤6): 4 full + 1 partial (identical verdicts),
+`gen+bin` 26s, `mine` 156s, peak **1.53 GB**. xor correctly emits **0** rules
+(the gate+noise rules fail the val-gap at scale).
+
+## Very deep rules — depth up to 10 (`experiments/deep10.py`)
+
+Light but deep: 200K × 100, three patterns whose true conjunction length is 8–10
+(two chains + one of five two-sided bands = 10 conditions), bins=16,
+`max_depth=10`, beam=24. Loose per-condition thresholds keep a depth-10 region
+~0.3–1% of rows (rare but learnable); because every planted fraud satisfies every
+condition, each TRUE condition carries univariate lift ~1/passrate, so the beam
+seeds and climbs while the recall floor keeps it on true conditions.
+
+| pattern | true depth | recovered depth | conditions | valP / valR |
+|---|---|---|---|---|
+| deep10_chain | 10 | 10 | **10/10** | 0.53 / 0.24 |
+| deep8_chain | 8 | 8 | **8/8** | 0.75 / 0.20 |
+| deep10_bands | 10 (5 bands) | 10 | **5/5 bands** | 0.72 / 0.25 |
+
+**3/3 recovered in 7.6s / 0.34 GB.** Depth is not the obstacle when each
+condition carries marginal signal — the miner reconstructs all 10 conditions
+(bands included). Recall is ~0.2–0.25 by construction: reaching precision 0.5 at
+depth 10 restricts to a high-purity core, the inherent precision/recall tradeoff
+the recall floor governs. The genuine obstacle is *interaction without marginal
+signal* (the XOR case), not depth per se.
+
+```bash
+PYTHONPATH=. python3 experiments/hard_recovery.py              # 6 hard patterns, 200K
+PYTHONPATH=. python3 experiments/hard_scale.py --n 1000000 --features 500
+PYTHONPATH=. python3 experiments/deep10.py                     # depth-10 recovery, 200K
+```

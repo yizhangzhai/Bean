@@ -97,6 +97,8 @@ prototype uses on-demand boolean masks (swap in bitset+popcount for production).
 arp/
   data.py        synthetic multi-type fraud (hidden signatures + heavy-tailed $)
                  + memory-safe fused generate->bin for large N
+  hard_data.py   hard patterns: deep / disjunctive / banded / heavy-tailed /
+                 gated-XOR adversary, with correlated decoys
   encoding.py    percentile-threshold predicates ("decision stumps")
   scoring.py     label-as-query scoring + objectives (single/weighted/maximin/fairness)
   search.py      reference beam search + coarse-to-fine refine + val eval
@@ -113,6 +115,9 @@ experiments/
   scale_fused.py same, memory-safe fused path (~2.6GB peak)
   bitset_bench.py histogram vs coarse-to-fine+bitset (4.8x-9x on mine)
   targeted.py    precision/recall/val-gap targeted growth demo
+  hard_recovery.py deep/disjunctive/banded/XOR recovery (4 full,1 partial,1 miss)
+  hard_scale.py  hard-pattern mining time+space at scale
+  deep10.py      depth-10 rule recovery (3/3) -- 200K x 100, 7.6s, 0.34GB
 tests/           smoke + correctness (label-as-query identity, GT recovery, ...)
 ```
 

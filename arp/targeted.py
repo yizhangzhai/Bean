@@ -97,10 +97,13 @@ def targeted_beam_search(
     beam_width=8,
     max_depth=4,
     Xbin_val=None, Y_val=None, gap_tol=None,
+    max_accept=2000,
 ):
     """Grow rules toward (precision >= target, recall >= floor); return accepted.
 
-    Returns (accepted, trace) where trace logs why paths stopped.
+    Returns (accepted, trace) where trace logs why paths stopped. `max_accept`
+    caps the accepted pool so a strong, common pattern can't generate tens of
+    thousands of near-duplicate variants before the minimality filter runs.
     """
     N, F = Xbin.shape
     yc = Y[:, target].astype(np.float64)
@@ -117,45 +120,65 @@ def targeted_beam_search(
     def make_rule(preds, support, tp, depth):
         prec = tp / support if support > 0 else 0.0
         rec = tp / total_c if total_c > 0 else 0.0
-        r = TargetedRule(tuple(preds), int(support), tp, prec, rec, depth=depth)
-        if have_val:
-            r.val_precision, r.val_recall = _eval_val(preds, Xbin_val, yc_val,
+        # train-only metrics here; val is computed lazily (it is expensive and
+        # ~99% of candidates die on the recall floor before ever needing it)
+        return TargetedRule(tuple(preds), int(support), tp, prec, rec, depth=depth)
+
+    def add_val(r):
+        if have_val and np.isnan(r.val_precision):
+            r.val_precision, r.val_recall = _eval_val(r.preds, Xbin_val, yc_val,
                                                       total_c_val)
-            r.gap = prec - r.val_precision
+            r.gap = r.precision - r.val_precision
         return r
 
-    def classify(r):
-        """-> ('prune'|'accept'|'grow', reason). Applies the three rules."""
+    def triage_train(r):
+        """Cheap train-only split: recall floor / precision target / grow."""
         if r.recall < min_recall:
-            return "prune", "recall<floor"          # admissible: subtree dead
-        if gap_tol is not None and have_val and r.gap > gap_tol:
-            return "prune", "train/val gap"
-        if r.precision >= target_precision:
-            return "accept", "precision target met"
-        return "grow", ""
+            return "prune"                          # admissible: subtree dead
+        return "accept" if r.precision >= target_precision else "grow"
+
+    def settle(accept_cands, grow_cands):
+        """Apply val-gap only to survivors: accepted + selected beam."""
+        for r in accept_cands:
+            if len(accepted) >= max_accept:
+                break
+            add_val(r)
+            if gap_tol is not None and have_val and r.gap > gap_tol:
+                pruned["train/val gap"] += 1
+            else:
+                r.stop_reason = "precision target met"
+                accepted.append(r)
+        # rank grow candidates on train precision, gap-check only the top beam
+        grow_cands.sort(key=lambda r: (r.precision, r.recall), reverse=True)
+        beam = []
+        for r in grow_cands:
+            if len(beam) >= beam_width:
+                break
+            add_val(r)
+            if gap_tol is not None and have_val and r.gap > gap_tol:
+                pruned["train/val gap"] += 1
+                continue
+            r.mask = _rule_mask(r.preds, Xbin)
+            beam.append(r)
+        return beam
 
     # ---- depth 1 ----
-    beam = []
+    acc_c, grow_c = [], []
     for f in range(F):
         for op, k, s, tp in _hist_tp(Xbin[:, f], yc, spec.n_bins, min_support):
             r = make_rule([(f, op, k)], s, tp, 1)
-            action, reason = classify(r)
-            r.stop_reason = reason
-            if action == "prune":
-                pruned[reason] += 1
-                continue
-            if action == "accept":
-                accepted.append(r)
+            a = triage_train(r)
+            if a == "prune":
+                pruned["recall<floor"] += 1
+            elif a == "accept":
+                acc_c.append(r)
             else:
-                beam.append(r)
-    beam.sort(key=lambda r: (r.precision, r.recall), reverse=True)
-    beam = beam[:beam_width]
-    for r in beam:
-        r.mask = _rule_mask(r.preds, Xbin)
+                grow_c.append(r)
+    beam = settle(acc_c, grow_c)
 
     # ---- grow ----
     for depth in range(2, max_depth + 1):
-        nxt = []
+        acc_c, grow_c, seen = [], {}, set()
         for r in beam:
             idx = np.flatnonzero(r.mask)
             sub_yc = yc[idx]
@@ -166,32 +189,40 @@ def targeted_beam_search(
                     if (f, op) in used:
                         continue
                     nr = make_rule(r.preds + ((f, op, k),), s, tp, depth)
-                    action, reason = classify(nr)
-                    nr.stop_reason = reason
-                    if action == "prune":
-                        pruned[reason] += 1
-                        continue
-                    if action == "accept":
-                        accepted.append(nr)
+                    a = triage_train(nr)
+                    if a == "prune":
+                        pruned["recall<floor"] += 1
+                    elif a == "accept":
+                        acc_c.append(nr)
                     else:
-                        nxt.append(nr)
-        if not nxt:
+                        kk = nr.key()
+                        if kk not in seen or nr.precision > grow_c[kk].precision:
+                            seen.add(kk)
+                            grow_c[kk] = nr
+        if not acc_c and not grow_c:
             break
-        best = {}
-        for r in nxt:
-            if r.key() not in best or r.precision > best[r.key()].precision:
-                best[r.key()] = r
-        beam = sorted(best.values(), key=lambda r: (r.precision, r.recall),
-                      reverse=True)[:beam_width]
-        for r in beam:
-            r.mask = _rule_mask(r.preds, Xbin)
+        beam = settle(acc_c, list(grow_c.values()))
+        if (not beam and not acc_c) or len(accepted) >= max_accept:
+            break
 
-    # dedup accepted, keep best precision per condition-set, drop dominated
+    # dedup by condition-set (keep best precision)
     uniq = {}
     for r in accepted:
         if r.key() not in uniq or r.precision > uniq[r.key()].precision:
             uniq[r.key()] = r
-    out = sorted(uniq.values(), key=lambda r: (r.recall, r.precision), reverse=True)
-    trace.append(f"accepted={len(out)}  pruned: recall_floor="
-                 f"{pruned['recall<floor']}  val_gap={pruned['train/val gap']}")
+    # minimality: a rule that strictly contains an already-accepted (simpler)
+    # rule is redundant -- the shorter rule already meets the target. Keep only
+    # minimal accepted rules. Collapses thousands of deeper extensions to cores.
+    cand = sorted(uniq.values(), key=lambda r: (len(r.preds), -r.precision))
+    kept, kept_sets = [], []
+    for r in cand:
+        fs = frozenset(r.preds)
+        if any(ks <= fs for ks in kept_sets):
+            continue
+        kept.append(r)
+        kept_sets.append(fs)
+    out = sorted(kept, key=lambda r: (r.recall, r.precision), reverse=True)
+    trace.append(f"accepted={len(out)} (of {len(uniq)} pre-minimality)  "
+                 f"pruned: recall_floor={pruned['recall<floor']}  "
+                 f"val_gap={pruned['train/val gap']}")
     return out, trace
