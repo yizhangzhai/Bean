@@ -87,3 +87,59 @@ PYTHONPATH=. python3 experiments/recovery.py                                  # 
 PYTHONPATH=. python3 experiments/scale.py        --n 2000000 --features 1000  # naive (will swap on <=18GB)
 PYTHONPATH=. python3 experiments/scale_fused.py  --n 2000000 --features 1000  # fused, ~2.6GB
 ```
+
+## Coarse-to-fine + bitmask (`arp.bitset`, `experiments/bitset_bench.py`)
+
+Two optimizations aimed at the `mine` bottleneck, composed:
+
+- **Coarse-to-fine = feature pruning.** A cheap depth-1 pass (skip thresholds +
+  row subsample) ranks features by univariate lift; only the **top-k** (e.g.
+  1000→64) enter the deep beam search. In the histogram design, depth-1 cost is
+  the `bincount` over N, *not* the threshold count — so the leverage is cutting
+  **F**, not shrinking bins.
+- **Bitmask conjunctions.** Surviving predicates are packed to bits
+  (`np.packbits`); a rule mask = bitwise-`AND`, support/caught = `popcount`
+  (`np.bitwise_count`). Removes the subset-gather of the histogram path.
+  *Count-mode only* — `popcount` can't sum dollar weights, so dollar-lift stays
+  on histograms (mine on counts, rank survivors by dollars).
+
+Same data, same recovery (3/3), `mine` time only:
+
+| N | F | histogram subset-rescan | coarse-to-fine + bitset | speedup |
+|---:|---:|---:|---:|---:|
+| 1 M | 500 | 105.3s | 22.0s (rank 3 / build 8 / search 11) | **4.8×** |
+| 2 M | 1000 | 435.1s | 48.1s (rank 9 / build 16 / search 23) | **9.0×** |
+
+Speedup grows with F (more features pruned away). Rules are identical to the
+histogram path. `build_bits` is per-type here and is shareable across types —
+more speedup left on the table.
+
+## Targeted precision/recall growth (`arp.targeted`, `experiments/targeted.py`)
+
+Practical mining is governed by operating targets, and each target maps to a
+*monotonicity* fact:
+
+- **Recall floor → admissible early-stop.** Recall only falls as a rule grows,
+  so a shallow path below `min_recall` has no viable descendant — prune the
+  subtree (exact, never drops a good rule). This is subgroup-discovery's
+  optimistic-estimate pruning.
+- **Precision target → stop-on-satisfied.** Precision isn't monotone, so it
+  can't prune; but a path that reaches `target_precision` (with recall floor) is
+  accepted and not grown — the shortest sufficient rule, which generalizes best.
+- **Train/val gap → overfitting brake.** Each candidate is scored on held-out
+  data in parallel; if `train_precision − val_precision > gap_tol`, drop it.
+
+Result (200K × 80, target_precision=0.5, min_recall=0.30, gap_tol=0.08):
+
+| type | outcome | depth | P / R (train) | P / R (val) | pruned by recall floor |
+|---|---|---|---|---|---|
+| account_takeover | **rejected** (no rule generalizes at decile resolution) | — | — | — | 16,619 (+249 val-gap) |
+| collusion | accepted, recovers GT | 3 | 0.61 / 0.92 | 0.59 / 0.92 | 13,081 |
+| friendly_fraud | accepted, recovers GT | 2 | 0.58 / 0.90 | 0.58 / 0.91 | 20,687 |
+
+Takeaways: the recall floor prunes **13k–20k overfit deep paths** per type (both
+an efficiency win and an overfit guard); the precision target stops growth at
+the true signature depth; and the val-gap correctly **refuses** to emit
+`account_takeover` — whose true `f1>p95` cut is inexpressible at decile bins, so
+every path that hits P=0.5 overfits. The honest fix is finer bins (coarse-to-fine
+refinement), not a looser guard.

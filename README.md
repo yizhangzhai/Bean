@@ -96,14 +96,29 @@ prototype uses on-demand boolean masks (swap in bitset+popcount for production).
 ```
 arp/
   data.py        synthetic multi-type fraud (hidden signatures + heavy-tailed $)
+                 + memory-safe fused generate->bin for large N
   encoding.py    percentile-threshold predicates ("decision stumps")
   scoring.py     label-as-query scoring + objectives (single/weighted/maximin/fairness)
-  search.py      beam search over conjunctions + coarse-to-fine refine + val eval
+  search.py      reference beam search + coarse-to-fine refine + val eval
+  fast.py        SCALABLE miner: int8 histogram bins, no dense M, subset rescan
+  bitset.py      coarse-to-fine feature pruning + bitmask (AND/popcount) conjunctions
+  targeted.py    precision/recall-targeted growth (admissible recall-floor prune,
+                 precision-target stop, train/val-gap overfit brake)
   portfolio.py   greedy maximin type-balanced rule portfolio
   baselines.py   sklearn decision-tree comparison
   demo.py        end-to-end runnable demo
+experiments/
+  recovery.py    does it recover planted patterns? (3/3) + timing
+  scale.py       scaling benchmark to 2M x 1000 (naive path)
+  scale_fused.py same, memory-safe fused path (~2.6GB peak)
+  bitset_bench.py histogram vs coarse-to-fine+bitset (4.8x-9x on mine)
+  targeted.py    precision/recall/val-gap targeted growth demo
 tests/           smoke + correctness (label-as-query identity, GT recovery, ...)
 ```
+
+See [experiments/README.md](experiments/README.md) for full results: 3/3 pattern
+recovery up to 2M x 1000, linear scaling, the dense-matrix memory lessons, the
+9x bitmask speedup, and targeted precision/recall growth.
 
 ## Run
 
