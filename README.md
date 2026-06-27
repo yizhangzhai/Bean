@@ -1,163 +1,347 @@
 # attention-rule-paths (`arp`)
 
-Mining conjunctive **decision paths** (e.g. `A > p90 AND B < p10`) with a
-**parameter-free, label-as-query "attention"** heuristic — a training-free
-cousin of a decision tree / association-rule miner, built for **multi-type,
-dollar-weighted fraud** detection.
+**Mine interpretable conjunctive rules ("decision paths") from tabular data —
+governed by precision/recall targets, scalable to 2M × 1000, and constrained to
+meet interpretability/policy requirements.**
 
-This is a prototype of the idea developed in conversation. The notes below map
-each design choice back to the reasoning so it stays honest about what is novel
-(the iterative rule growth + portfolio balancing) and what is not (the
-"attention", which is really a co-occurrence/alignment kernel).
+A rule looks like:
 
-## The core idea
+```
+chargebacks > p90  AND  country in {NG, GH, KE}  AND  amount > p95   ⇒  fraud
+```
 
-1. **Threshold-bin encoding.** Every feature becomes a set of one-sided
-   percentile predicates ("decision stumps"): `f03 < p10`, `f00 > p90`, … Each
-   instance is implicitly a binary vector over these bins (we never materialize
-   the full matrix `M` — see *Scalability*).
+The framework discovers such rules per outcome (e.g. per fraud type), in
+dollar-weighted or count terms, with deployment-grade controls on rule shape.
 
-2. **Label-as-query attention = one matmul.** A rule's strength is
+---
 
-   ```
-   caught = mask.astype(float) @ Yw          # (C,) per fraud type
-   lift   = (caught / support) / base_rate
-   ```
+## 1. Where this came from
 
-   The **query** is the label/loss column; the **key** is bin membership.
-   Dropping the learned `W_Q/W_K/W_V` is deliberate: with identity projections
-   `QK^T` *is* this alignment, and it's the quantity we want to read off as a
-   rule. There is no loss to train the projections against. (`scoring.py`)
+The project began from a single question: *can an attention mechanism quantify
+pairwise dependence among entities, the way a decision tree finds decision
+paths?* Working through it produced a concrete, honest answer:
 
-3. **Beam search over conjunctions.** Grow rules greedily, keeping the top-K
-   partial rules — like a tree picking the best split at a node, but
-   beam-limited. Conjunction membership is a boolean `AND` of masks (cheap,
-   exact). Each depth step scores **all** candidate predicates against a base
-   rule in one matmul. (`search.py`)
+- The "attention" here is **label-as-query, parameter-free** — a co-occurrence /
+  alignment kernel, **not** learned `W_Q/W_K/W_V`. It is one matrix product, and
+  that is exactly what you want to read off as a rule's strength.
+- The novel, useful parts are the **iterative rule growth** (beam search over
+  conjunctions), the **precision/recall-targeted** branch-and-bound, and the
+  **portfolio + constraint** layers — not the attention framing itself.
 
-4. **Coarse-to-fine.** Mine with coarse decile predicates, then `refine_rule`
-   sharpens each winning threshold within its local band at fine resolution and
-   re-validates — so full resolution is paid only on the survivors, and a sharp
-   fraud band a decile average would dilute still gets found.
+The README is deliberately honest about what is genuinely new vs. a re-derivation
+of decision-tree / association-rule / subgroup-discovery machinery, and about
+where the method fundamentally fails (greedy can't seed an interaction with no
+marginal signal — the XOR case).
 
-5. **Multi-type = multi-query.** One label vector `y` → label matrix `Y`
-   (N × C). `Y.T @ M` gives a per-type score for every bin in one shot — this
-   **is** multi-query attention, each fraud type a query, still parameter-free.
+---
 
-6. **Balance at the portfolio level, not inside each rule.** Fraud types have
-   distinct signatures, so we don't force one rule to be a generalist. We mine
-   strong per-type rules, then greedily assemble a set that maximizes the
-   **worst-covered type** (`portfolio.py`).
+## 2. The core idea (how it works)
 
-## Why not learned Q/K/V?
+### 2.1 Threshold-bin encoding → "decision stumps"
+Every numeric feature becomes a set of one-sided percentile predicates
+(`f > p90`, `f < p10`) plus two-sided **bands** (`p40 < f < p55`). Categorical
+features become **equality** (`== c`) and **subset** (`in {…}`) predicates. The
+data is represented as an integer matrix of bin indices / category codes — the
+dense one-hot membership matrix `M` is **never materialized**.
 
-No training objective ⇒ nothing to fit the projections with; identity
-projections recover the exact alignment we want, and keep the rules
-interpretable. Learned projections only pay off for **cross-type knowledge
-sharing** (a two-tower / multi-task embedding) when rare types are data-starved
-— at the cost of interpretability. `V` has essentially no role here: we
-*select* rules, we don't aggregate representations.
+### 2.2 Label-as-query "attention" = one matmul
+A rule's strength comes from a single product:
 
-## Dollar-weighting (fraud loss)
+```
+caught = mask @ Yw            # (C,)  per-outcome positives (or $) captured
+lift   = (caught / support) / base_rate
+```
 
-No weight *matrix* is needed — fraud loss is a property of the instance, so it's
-a **vector/column** `w`. Swap `Y` (counts) for the dollar-loss matrix `W` and
-the same matmul carries dollars. To net out false-positive cost, put negative
-entries for legit rows; `w @ M` becomes net value. Run `--dollars` to see a few
-expensive cases reshuffle the ranking vs. counts.
+The **query** is the label/loss column, the **key** is bin membership. With
+identity projections, `QKᵀ` *is* this alignment — there is no training objective,
+so there are no projection weights to learn. For multiple outcomes,
+`Yᵀ @ M` scores every bin for every outcome at once = **multi-query attention**,
+each outcome a query.
 
-## Scalability (what scales, what doesn't)
+### 2.3 Beam search over conjunctions = "decision paths"
+Rules grow greedily, keeping the top-K partial rules (like a tree picking the
+best split at a node, but beam-limited). Conjunction membership is a boolean
+`AND`; each depth step scores all candidate predicates in one pass.
 
-| Operation | Cost | Scales? |
+### 2.4 Practical growth: precision/recall targets (branch-and-bound)
+Real mining is governed by operating targets, each tied to a monotonicity fact:
+
+| Target | Monotonicity | Mechanism |
 |---|---|---|
-| `Yw.T @ M` (label-as-query scoring) | `O(N·P)` | ✅ linear |
-| beam expansion (`AND` + matmul) | `O(beam·P·N)` per depth | ✅ |
-| **full bin–bin `MᵀM` attention** | `O(N·P²)` | ❌ never build it |
-| dense `M` | `N × P`, ~50% dense | ❌ don't materialize |
+| **recall floor** | recall only *falls* as a rule grows | **admissible early-stop** — prune a subtree once it's below the floor (never discards a viable rule) |
+| **precision target** | precision is *not* monotone | **stop-on-satisfied** — accept the shortest rule that reaches it (generalizes best) |
+| **train/val gap** | overfitting widens with depth | **overfit brake** — drop a rule whose held-out precision lags train by `gap_tol` |
 
-The binding constraint is **interaction depth × feature count**, controlled by
-beam width + coarse-to-fine + feature pre-filtering — *not* raw `N`. The same
-sorted-cumsum / histogram trick that lets LightGBM scale applies here; this
-prototype uses on-demand boolean masks (swap in bitset+popcount for production).
+### 2.5 Balancing & assembly
+Different outcomes have different signatures, so the framework mines **per
+outcome** and then assembles a **type-balanced portfolio** (greedy maximin —
+maximize the worst-covered type) rather than forcing one rule to be a generalist.
 
-## Honest cautions (built into the demo)
+---
 
-- **Overfitting at depth.** Train lift grows as rules deepen; the demo prints
-  **val lift** beside it so dilution/overfit is visible. A relative `min_gain`
-  makes a 3rd predicate earn its place.
-- **Min-support floor** everywhere, including after refinement.
-- **Heavy-tailed dollars** let a few cases dominate — keep counts *and* dollars
-  in view; winsorize if a handful hijack the search.
-- **Multiple testing ×C.** Screening millions of rules against C labels finds
-  chance lift; validate **per type** on held-out data (the demo does).
+## 3. Feature set
 
-## Layout
+| Capability | Module | Notes |
+|---|---|---|
+| Parameter-free label-as-query scoring | `scoring.py` | `mask @ Yw`; count- or dollar-weighted |
+| Multi-outcome (multi-type) mining | `scoring`, `fast`, `targeted` | each type is a query |
+| **Dollar / cost weighting** | everywhere | swap counts for `$`; negative entries net out false-positive cost |
+| Reference beam search + coarse-to-fine refine | `search.py` | clear, didactic implementation |
+| **Scalable miner** (histogram / cumsum, no dense `M`) | `fast.py` | int8 bins, subset-rescan; 2M × 1000 feasible |
+| **Coarse-to-fine feature pruning + bitmask** | `bitset.py` | `AND`/`popcount`; 4.8×–9× faster `mine` |
+| **Precision/recall-targeted growth** | `targeted.py` | recall-floor / precision-target / val-gap |
+| **Type-balanced portfolio** | `portfolio.py` | greedy maximin coverage |
+| **Numeric + categorical** | `mixed.py` | `==`, `in`-set via the Fisher sort-by-rate trick + smoothing |
+| **Interpretability constraints (in-search)** | `constraints.py` | monotonicity, 1-/2-way, ranges, forbidden/required/mutually-exclusive pairs, categorical eq-only / set caps |
+| Decision-tree baseline | `baselines.py` | sklearn comparison |
+| Synthetic data generators | `data.py`, `hard_data.py` | multi-type, heavy-tailed `$`, deep/disjunctive/banded/XOR patterns, decoys |
+
+---
+
+## 4. Architecture & data flow
+
+```
+            ┌─────────────┐   numeric → quantile bins (int8)
+ raw table  │  encode      │   categorical → category codes
+ ──────────▶│ fit_bins /   │──────────────┐
+            │  Meta        │               ▼
+            └─────────────┘        ┌──────────────────┐  candidate predicates:
+                                   │  candidate gen    │  num: > / < / band
+                          ┌───────▶│  (per feature)    │  cat: == / in {…}
+                          │        └──────────────────┘  filtered by RulePolicy
+                          │                 │
+        RulePolicy ───────┘                 ▼
+        (constraints)              ┌──────────────────┐  caught = mask @ Yw
+                                   │ label-as-query    │  lift / precision / recall
+                                   │ scoring           │  (count or $-weighted)
+                                   └──────────────────┘
+                                            │
+                                            ▼
+                                   ┌──────────────────┐  recall-floor prune,
+                                   │ beam search /     │  precision-target stop,
+                                   │ targeted growth   │  val-gap brake, minimality
+                                   └──────────────────┘
+                                            │  per outcome
+                                            ▼
+                                   ┌──────────────────┐
+                                   │ portfolio assembly│  maximin type balance
+                                   └──────────────────┘
+                                            │
+                                            ▼  compliant, scored rule set
+```
+
+**Why it scales:** the dense membership matrix `M` at 2M × 1000 would be **36 GB**
+(`O(N·P²)` for the bin–bin variant), impossible on commodity RAM. Instead,
+features are pre-binned to int8 and scored with `np.bincount` cumsums — no
+per-predicate mask is materialized, and conjunctions are grown by
+re-histogramming only a rule's (small) support set. This is the same histogram
+trick behind LightGBM. Memory beyond the bin matrix is `O(N)`.
+
+---
+
+## 5. Install & quick start
+
+```bash
+pip install -r requirements.txt        # numpy, scikit-learn (baseline only)
+
+python -m arp.demo                      # multi-type fraud, count-based lift
+python -m arp.demo --dollars            # dollar-loss-weighted lift
+python -m pytest tests/ -q              # correctness tests
+```
+
+### 5.1 Minimal end-to-end (scalable numeric miner)
+
+```python
+import numpy as np
+from arp import (make_binned_fraud_data_large, fit_bins,
+                 fast_beam_search, base_rates, objective_single)
+
+# binned synthetic data: Xbin (int8), spec, labels Y (N, C)
+Xbin, spec, Y, loss, names, type_names, gt = make_binned_fraud_data_large(
+    n=200_000, n_features=100, n_bins=10)
+
+Yw   = Y.astype(float)                  # use `loss` instead for $-weighting
+base = base_rates(Yw, len(Y))
+
+target = 0                              # which outcome/fraud type to mine
+objective = lambda lift: objective_single(lift, target)
+rules = fast_beam_search(Xbin, Yw, base, objective, spec,
+                         beam_width=8, max_depth=3, min_support=40)
+
+for r in rules[:3]:
+    print(r.label(names, spec), "| lift", round(float(r.lift[target]), 1))
+```
+
+### 5.2 Precision/recall-targeted growth (the practical path)
+
+```python
+from arp import targeted_beam_search
+
+rules, trace = targeted_beam_search(
+    Xbin_train, Y_train, target=0, spec=spec,
+    min_recall=0.25, target_precision=0.5, min_support=40,
+    beam_width=12, max_depth=6,
+    Xbin_val=Xbin_val, Y_val=Y_val, gap_tol=0.20)   # held-out overfit brake
+
+for r in rules:
+    print(f"P={r.precision:.2f} R={r.recall:.2f} "
+          f"valP={r.val_precision:.2f}  {r.label(names, spec)}")
+```
+
+### 5.3 Interpretability constraints
+
+```python
+from arp import RulePolicy, targeted_beam_search
+
+policy = RulePolicy.build(
+    monotone_up=[chargeback_idx],          # only "chargebacks > t" (risk ↑ with value)
+    one_way=[score_idx],                   # no two-sided bands on this feature
+    ranges={amount_idx: (0.50, 1.0)},      # only split amount in its upper half
+    disable=[leaky_feature_idx],           # never use this feature
+    forbidden_pairs=[(feat_a, feat_b)],    # may not co-appear in a rule
+    mutually_exclusive=[(f1, f2, f3)],     # at most one of these per rule
+    discouraged_pairs=[(g1, g2)],          # soft: avoided on ties
+)
+rules, _ = targeted_beam_search(..., policy=policy)   # every rule is compliant
+```
+
+### 5.4 Numeric + categorical
+
+```python
+import numpy as np
+from arp import Meta, mixed_targeted_search, fit_bins, RulePolicy
+
+Xb, spec = fit_bins(X_numeric, n_bins=12)
+M = np.concatenate([Xb.astype(np.int32), X_categorical_codes], axis=1)
+meta = Meta(names=feature_names,
+            kind=["num"]*n_num + ["cat"]*n_cat,
+            size=[12]*n_num + cardinalities)
+
+policy = RulePolicy.build(
+    cat_set_only=[country_idx],            # country only as a subset, never ==
+    max_set_size={country_idx: 5},         # at most 5 countries in one rule
+)
+rules, pruned = mixed_targeted_search(
+    M_train, y_train, meta, min_recall=0.25, target_precision=0.5,
+    M_val=M_val, y_val=y_val, gap_tol=0.2, policy=policy)
+```
+
+### 5.5 Dollar-weighting & portfolio
+
+```python
+from arp import build_portfolio
+# mine per type into `all_rules`, then balance coverage across types on val:
+port = build_portfolio(all_rules, X_val, W_val, max_rules=8)   # W_val = $ matrix
+print(port.covered_frac, "worst:", port.covered_frac.min())
+```
+
+---
+
+## 6. Results (validated, reproducible)
+
+All numbers measured on an 18 GB / 12-core machine; see
+[experiments/README.md](experiments/README.md) for full tables and commands.
+
+**Pattern recovery** — planted signatures recovered from noise features:
+
+| Setting | Result |
+|---|---|
+| 3 multi-type signatures, up to **2M × 1000** | **3/3** recovered |
+| Hard battery (deep/disjunctive/banded/heavy-tailed/XOR), 200K | **4 full, 1 partial, 1 miss** |
+| **Depth-10** chains + bands, 200K × 100 | **3/3** (all 10 conditions), 7.6 s, 0.34 GB |
+| Numeric + categorical, exact subsets | **3/3**, `cat_jac = 1.0` |
+
+**Scalability** (histogram path, depth-3, beam-8):
+
+| N × F | cells | bin | depth-1 scan | mine | peak RAM | recovered |
+|---:|---:|---:|---:|---:|---:|:--:|
+| 100 K × 100 | 1e7 | 0.4 s | 0.1 s | 1.3 s | 0.2 GB | 3/3 |
+| 1 M × 500 | 5e8 | 31 s | 13 s | 111 s | 2.7 GB | 3/3 |
+| **2 M × 1000** | 2e9 | 98 s* | 49 s | 425 s | 2.6 GB* | 3/3 |
+
+\* fused generate→bin path; the naive path's binning thrashed to swap (10 GB
+peak) — a 48× slowdown fixed by never materializing the float matrix.
+
+**Optimizations:** coarse-to-fine + bitmask gives **4.8×** (1M × 500) to **9.0×**
+(2M × 1000) speedup on `mine` with identical rules.
+
+---
+
+## 7. Design principles & honest limitations
+
+- **Never materialize a dense matrix you can stream.** Proved twice: the bin–bin
+  attention matrix would be 36 GB (never built), and even the float feature
+  matrix is fused away during binning.
+- **Greedy beam misses interactions with no marginal signal.** The `xor_gated`
+  pattern is found only as its gate; the `f14 ⊕ f15` interaction is invisible to
+  any greedy seed. This is the fundamental boundary — *interaction without
+  marginal signal*, **not depth** (depth-10 conjunctions recover fine). The fix
+  is a cross-feature combination pre-miner that seeds such interactions (planned).
+- **Disjunctions** currently recover the strongest branch; sequential covering
+  (remove covered positives, re-mine) is the fix.
+- **Target-encoding leakage** for categoricals (sorting levels by fraud rate) is
+  controlled by smoothing + min-support + the train/val gap; do the ordering
+  out-of-fold for production.
+- **Multiple testing × C**: screening millions of rules finds chance lift —
+  always validate **per outcome** on held-out data (every experiment does).
+- **Constraints make the interpretability↔performance tradeoff explicit.** E.g.
+  forcing a categorical to equality-only cost 32 points of recall on one
+  pattern — the framework surfaces that cost rather than hiding it.
+
+---
+
+## 8. Module reference
 
 ```
 arp/
-  data.py        synthetic multi-type fraud (hidden signatures + heavy-tailed $)
-                 + memory-safe fused generate->bin for large N
+  data.py        multi-type fraud generator (+ heavy-tailed $; memory-safe
+                 fused generate→bin for large N)
   hard_data.py   hard patterns: deep / disjunctive / banded / heavy-tailed /
-                 gated-XOR adversary, with correlated decoys
+                 gated-XOR, with correlated decoys
   encoding.py    percentile-threshold predicates ("decision stumps")
   scoring.py     label-as-query scoring + objectives (single/weighted/maximin/fairness)
   search.py      reference beam search + coarse-to-fine refine + val eval
   fast.py        SCALABLE miner: int8 histogram bins, no dense M, subset rescan
-  bitset.py      coarse-to-fine feature pruning + bitmask (AND/popcount) conjunctions
-  targeted.py    precision/recall-targeted growth (admissible recall-floor prune,
-                 precision-target stop, train/val-gap overfit brake); accepts a
-                 RulePolicy to enforce interpretability constraints in-search
-  constraints.py RulePolicy: monotone direction / 1-way-2-way / threshold range /
-                 disable / forbidden+mutually-exclusive pairs / categorical
-                 eq-only / set-size cap / allowed-levels / soft discouraged pairs
-  mixed.py       numeric + categorical predicates (==, in-set via Fisher trick);
-                 honors RulePolicy for categorical constraints too
+  bitset.py      coarse-to-fine feature pruning + bitmask (AND/popcount)
+  targeted.py    precision/recall-targeted growth; accepts a RulePolicy
+  constraints.py RulePolicy: direction / 1-2-way / range / disable / forbidden /
+                 mutually-exclusive / required-with / categorical eq-set caps /
+                 soft discouraged pairs
+  mixed.py       numeric + categorical predicates; honors RulePolicy
   portfolio.py   greedy maximin type-balanced rule portfolio
   baselines.py   sklearn decision-tree comparison
   demo.py        end-to-end runnable demo
-experiments/
-  recovery.py    does it recover planted patterns? (3/3) + timing
-  scale.py       scaling benchmark to 2M x 1000 (naive path)
-  scale_fused.py same, memory-safe fused path (~2.6GB peak)
-  bitset_bench.py histogram vs coarse-to-fine+bitset (4.8x-9x on mine)
-  targeted.py    precision/recall/val-gap targeted growth demo
-  hard_recovery.py deep/disjunctive/banded/XOR recovery (4 full,1 partial,1 miss)
-  hard_scale.py  hard-pattern mining time+space at scale
-  deep10.py      depth-10 rule recovery (3/3) -- 200K x 100, 7.6s, 0.34GB
-  mixed_recovery.py numeric+categorical recovery (3/3, exact category subsets)
-  constrained.py interpretability constraints enforced during discovery (numeric)
-  constrained_cat.py categorical constraints: eq-only / set-cap / forbidden pair
-tests/           smoke + correctness (label-as-query identity, GT recovery, ...)
+experiments/     reproducible studies (see experiments/README.md)
+  recovery, scale, scale_fused, bitset_bench, targeted, hard_recovery,
+  hard_scale, deep10, mixed_recovery, constrained, constrained_cat
+tests/           correctness (label-as-query identity, GT recovery, portfolio, refine)
 ```
 
-See [experiments/README.md](experiments/README.md) for full results: 3/3 pattern
-recovery up to 2M x 1000, linear scaling, the dense-matrix memory lessons, the
-9x bitmask speedup, and targeted precision/recall growth.
+Run any study with `PYTHONPATH=. python3 experiments/<name>.py`.
 
-## Run
+---
 
-```bash
-pip install -r requirements.txt
-python -m arp.demo            # count-based lift
-python -m arp.demo --dollars  # dollar-loss-weighted lift
-python -m pytest tests/ -q    # or: python -c "import tests.test_basic as t; [getattr(t,f)() for f in dir(t) if f.startswith('test_')]"
-```
+## 9. Roadmap
 
-## What the demo shows
+- **Cross-feature combination pre-miner** (out-of-fold) to seed the interactions
+  greedy beam can't reach — the one documented capability gap.
+- **Sequential covering** for full disjunction recovery.
+- Constraints folded into the **portfolio** layer (joint recall under per-rule policy).
+- Production swaps: bitset+popcount membership end-to-end, significance
+  correction for the multiple-testing screen, and a real fraud table in place of
+  the synthetic generators.
 
-On synthetic data with three hidden signatures of differing rarity/cost:
+---
 
-- The miner **recovers all three ground-truth signatures**, including
-  collusion's two-sided band `p40 < f02 < p55 AND f03 < p10`.
-- The **decision-tree baseline finds only the common type** (f04/f05) and misses
-  the two rare/expensive ones — the failure mode the per-type + portfolio design
-  is meant to fix.
-- The portfolio spreads coverage across all three types (the worst-covered type
-  is reported), instead of piling onto the easy one.
+## 10. What this is / isn't
 
-## Status / next steps
+**Is:** a training-free, interpretable, scalable conjunctive-rule miner with
+operating-target control and policy constraints — a modern synthesis of decision
+stumps + beam search + subgroup discovery + histogram scaling, with an
+attention-flavored scoring view.
 
-Prototype. Natural extensions: bitset+popcount membership, sorted-cumsum
-single-feature scoring, learned cross-type embeddings for rare types,
-significance correction for the multiple-testing screen, and a real fraud table
-in place of the synthetic generator.
+**Isn't:** a learned model. There are no gradients and no fitted weights; the
+"attention" is a deterministic alignment kernel. If you need cross-type
+statistical strength sharing for very rare types, that's where a *learned*
+two-tower embedding would earn its keep — at the cost of the interpretability
+this framework is built to preserve.
