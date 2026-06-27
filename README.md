@@ -313,7 +313,7 @@ arp/
   demo.py        end-to-end runnable demo
 experiments/     reproducible studies (see experiments/README.md)
   recovery, scale, scale_fused, bitset_bench, targeted, hard_recovery,
-  hard_scale, deep10, mixed_recovery, constrained, constrained_cat
+  hard_scale, deep10, intervals, mixed_recovery, constrained, constrained_cat
 tests/           correctness (label-as-query identity, GT recovery, portfolio, refine)
 ```
 

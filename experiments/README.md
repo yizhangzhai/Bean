@@ -205,3 +205,22 @@ PYTHONPATH=. python3 experiments/hard_recovery.py              # 6 hard patterns
 PYTHONPATH=. python3 experiments/hard_scale.py --n 1000000 --features 500
 PYTHONPATH=. python3 experiments/deep10.py                     # depth-10 recovery, 200K
 ```
+
+## Value intervals (`experiments/intervals.py`)
+
+Two-sided value intervals like `1 < A < 10`, on Uniform(0,20) features so the
+recovered percentile band translates back to exact real units via `spec.edges`.
+
+| planted (real units) | recovered | val P/R |
+|---|---|---|
+| `1 < f00 < 10` | `1.00 < f00 < 10.01` | 0.80 / 0.99 |
+| `5 < f01 < 8 AND f02 > 15` | `5.02 < f01 < 8.01 AND f02 > 15.01` | 0.87 / 0.95 |
+| `2 < f03 < 6 AND 12 < f04 < 18` | `1.99 < f03 < 6.00 AND 12.03 < f04 < 18.03` | 0.87 / 0.96 |
+
+**3/3, bounds exact to bin resolution (~0.03).** One subtlety worth knowing: a
+two-sided interval is fully recovered only when **both bounds are needed to hit
+`target_precision`**. With a low target, `f0 < 10` alone (precision 0.72) already
+satisfies it, so the miner correctly returns the shorter *sufficient* half-open
+rule and never adds `f0 > 1` (Occam / minimality). Raising the target toward the
+pattern's ceiling forces the closed interval. So interval completeness is a knob
+(`target_precision`), not a yes/no capability.
