@@ -48,36 +48,47 @@ def best_band(v, lbl, n_bins=24, min_support=30, min_recall=0.25):
     return best
 
 
-def ring_score(xi, xj, gap_mask, min_support=30):
+def ring_score(xi, xj, gap_mask, min_support=30, nb=24):
     """Topology-lite H1 detector: do gap positives form a ring around a void?
 
-    Returns (score in [0,1], center, radius). High when residual positives sit
-    in a tight shell whose interior is empty of THEM but populated by other
-    points -- the hallmark of a 1-D hole that a radial feature collapses.
+    Uses an AREA-NORMALIZED radial density peak/void test (robust to background
+    contamination, unlike a global std-of-radius tightness): for points uniform
+    in 2D, count per radial shell grows like r, so count/r is flat; a ring makes
+    count/r spike at its radius while the interior stays empty. Returns
+    (score in [0,1], center, peak-radius). High == a genuine ring/void.
     """
     res = np.c_[xi[gap_mask], xj[gap_mask]]
     if len(res) < min_support:
         return 0.0, None, 0.0
-    center = np.median(res, axis=0)
-    r_all = np.hypot(xi - center[0], xj - center[1])
-    r_res = r_all[gap_mask]
-    R = float(np.median(r_res))
-    if R <= 1e-6:
-        return 0.0, None, 0.0
-    inside_frac = float((r_res < 0.5 * R).mean())        # ring -> few inside
-    tight = max(0.0, 1.0 - float(np.std(r_res)) / R)     # tight shell
-    others_inside = int((r_all[~gap_mask] < 0.5 * R).sum())
-    occupied = 1.0 if others_inside >= min_support else 0.3  # void, not empty space
-    return (1.0 - inside_frac) * tight * occupied, center, R
+    center = np.median(res, axis=0)                       # robust to outliers
+    r_res = np.hypot(res[:, 0] - center[0], res[:, 1] - center[1])
+    rmax = float(np.percentile(r_res, 99))
+    if rmax <= 1e-6:
+        return 0.0, center, 0.0
+    edges = np.linspace(0, rmax, nb + 1)
+    hist, _ = np.histogram(r_res, bins=edges)
+    rc = (edges[:-1] + edges[1:]) / 2
+    dens = hist / np.maximum(rc, 1e-9)                     # area-normalized
+    pk = int(np.argmax(dens))
+    R = float(rc[pk])
+    if pk < 2 or hist[pk] < min_support:                  # peak at r~0 = a blob
+        return 0.0, center, R
+    inner = float(dens[: max(1, pk // 2)].mean())         # density inside the peak
+    void = dens[pk] / (inner + 1e-9)
+    return max(0.0, 1.0 - 1.0 / void), center, R          # ->1 as peak >> interior
 
 
 def propose_features(X, gap_mask, names, *, ring_thresh=0.5, max_features=5,
-                     eps=1e-6):
+                     periods=(7, 12, 24, 30, 60, 100, 168), eps=1e-6):
     """Rank candidate engineered features that separate the gap positives.
 
-    Topology-guided radial features first (where a ring is detected), then
-    generic ratio / diff / product transforms -- all scored by best_band lift
-    on the residual.  Returns list of dicts.
+    Families, all scored by best_band lift on the residual:
+      * radial   (topology-guided, where a ring/void is detected)
+      * ratio / diff  (algebraic interactions)
+      * periodic  (x mod P for candidate periods -- catches repeating/temporal
+                   structure a raw band can't express; the winning period falls
+                   out of the lift ranking, a stand-in for FFT auto-detection)
+    Returns list of dicts.
     """
     F = X.shape[1]
     lbl = gap_mask.astype(float)
@@ -109,6 +120,18 @@ def propose_features(X, gap_mask, names, *, ring_thresh=0.5, max_features=5,
                     cands.append(dict(
                         name=f"{names[i]} {('/' if kind=='ratio' else '-')} {names[j]}",
                         transform=tf, kind=kind, lift=b[0], band=b, topo=0.0))
+
+    # 3) periodic transforms: x mod P for each candidate period
+    for i in range(F):
+        rng = float(X[:, i].max() - X[:, i].min())
+        for P in periods:
+            if P >= rng or P <= 0:
+                continue                              # period must fit the range
+            tf = lambda A, i=i, P=P: np.mod(A[:, i], P)
+            b = best_band(tf(X), lbl)
+            if b:
+                cands.append(dict(name=f"{names[i]} mod {P}", transform=tf,
+                                  kind="periodic", lift=b[0], band=b, topo=0.0))
 
     cands.sort(key=lambda c: c["lift"], reverse=True)
     # dedup by name, keep best

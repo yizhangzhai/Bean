@@ -351,7 +351,7 @@ featgap/         SEPARATE feature-engineering layer (depends on arp, not vice
 experiments/     reproducible studies (see experiments/README.md)
   recovery, scale, scale_fused, bitset_bench, targeted, hard_recovery,
   hard_scale, deep10, intervals, mixed_recovery, constrained, constrained_cat,
-  featgap_triage, supervised_bins
+  featgap_triage, supervised_bins, integrated
 tests/           correctness (label-as-query identity, GT recovery, portfolio, refine)
 ```
 
@@ -392,6 +392,28 @@ at **lift 10.3**; re-mining lifts coverage to **0.73**.
 > Other gap-ID methods (and when to prefer them) are catalogued in the triage:
 > residual re-mine and interaction screens resolve most gaps cheaply; topology
 > earns its keep only for genuine hole/loop structure.
+
+### Integrated pipeline (`experiments/integrated.py`)
+
+The full system on a diverse fraud population — one label fired by **five distinct
+modus operandi**: a deep axis conjunction, an axis band, a **ring**, a **ratio**
+ridge, and a **periodic** (mod-24) pattern. The pipeline runs **supervised
+binning → rule search → iterative featgap** (diagnose → synthesize the best
+feature → re-mine) until coverage plateaus:
+
+```
+[round 0] axis rules only                         coverage 0.30
+[round 1] + f04 mod 24   (periodic)  closes MO5   coverage 0.66
+[round 2] + dist(f0,f1)  (radial)    closes ring  coverage 0.78
+[round 3] + f09/f08      (ratio)     closes MO2   coverage 0.91
+[round 4] + f06-f07      (diff)      closes MO1   coverage 0.98
+```
+
+Each round engineers exactly one feature that closes one non-axis MO. The
+contamination-robust ring detector (area-normalized radial density peak/void)
+recovers the ring center `(20.0,20.2)` even buried in the multi-MO residual.
+`featgap.synthesize` covers radial / ratio / diff / **periodic (x mod P)**
+transforms.
 
 ## 9. Roadmap
 
