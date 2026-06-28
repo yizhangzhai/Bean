@@ -253,9 +253,10 @@ def run(n=500_000, n_features=200, n_patterns=100, bad_rate=0.02, seed=0):
     # ---- recover_deep (sequential covering, LightGBM detector) ----
     t0 = time.perf_counter()
     _, cov_tr = uncovered_positives(base, Xtr_b, ytr)
-    deep, infos = recover_deep(Xtr_b, Xva_b, spec, ytr, yva, cov_tr, max_rounds=60,
-                               top_k=22, seed_n=250, target_precision=0.55,
-                               precision_floor=0.15, min_recall=0.004, min_support=20,
+    deep, infos = recover_deep(Xtr_b, Xva_b, spec, ytr, yva, cov_tr, max_rounds=80,
+                               top_k=22, seed_n=250, target_precision=0.6,
+                               min_accept_precision=0.3, max_misses=15,
+                               min_recall=0.004, min_support=20,
                                beam_width=64, max_depth=18, seed=seed, verbose=True)
     print(f"  [recover_deep {time.perf_counter()-t0:.0f}s]  "
           f"{len(deep)} deep rules over {len(infos)} rounds")
