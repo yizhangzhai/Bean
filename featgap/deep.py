@@ -79,8 +79,35 @@ def _kl_block(Xtr, seed_rows, hist_all, n_bins, top_k, eps=1e-9):
     return np.argsort(kl)[::-1][:top_k]
 
 
+def _seed_clusters(model, Xsc, resid_idx, n_seeds, seed_n, min_support, seed):
+    """Split the residual positives into up to n_seeds DISTINCT seeds for one
+    detector fit -- by leaf co-membership (subspace-aware: a cluster ~ one
+    pattern). Each search still runs on the FULL data, so no fragmentation; we
+    only diversify WHERE to look so a round can capture several patterns."""
+    if n_seeds <= 1 or resid_idx.size < 2 * min_support:
+        order = np.argsort(model.predict_proba(Xsc)[:, 1])[::-1]
+        return [resid_idx[order[:min(seed_n, resid_idx.size)]]]
+    from sklearn.cluster import MiniBatchKMeans
+    from sklearn.preprocessing import OneHotEncoder
+    ncl = int(min(n_seeds, resid_idx.size // (2 * min_support)))
+    try:
+        leaves = model.booster_.predict(Xsc, pred_leaf=True)
+        emb = OneHotEncoder(handle_unknown="ignore").fit_transform(leaves)
+        labels = MiniBatchKMeans(ncl, n_init=3, random_state=seed,
+                                 batch_size=2048).fit_predict(emb)
+    except Exception:
+        order = np.argsort(model.predict_proba(Xsc)[:, 1])[::-1]
+        return [resid_idx[order[:min(seed_n, resid_idx.size)]]]
+    out = []
+    for c in range(ncl):
+        rows = resid_idx[labels == c]
+        if rows.size >= min_support:
+            out.append(rows[:seed_n])
+    return out or [resid_idx[:min(seed_n, resid_idx.size)]]
+
+
 def recover_deep(Xtr, Xva, spec, ytr, yva, covered_tr, *, max_rounds=6,
-                 top_k=16, seed_n=300, target_precision=0.7,
+                 top_k=16, seed_n=300, n_seeds=1, target_precision=0.7,
                  min_accept_precision=0.3, max_misses=8,
                  min_recall=0.01, min_support=40, beam_width=64, max_depth=18,
                  subsample=80_000, seed=0, detector="lgbm",
@@ -146,11 +173,10 @@ def recover_deep(Xtr, Xva, spec, ytr, yva, covered_tr, *, max_rounds=6,
                 return best
         return best if (best and best[3] >= min_support) else None
 
-    # Each round refits the detector on the current residual -- the fresh ranking
-    # (model stochasticity + the shrinking residual) is what surfaces the NEXT
-    # pattern, so this is NOT wasted work. On a miss the seed region is marked
-    # tried and we re-seed; reset on a capture (residual changed).
-    tried = np.zeros(len(ytr), dtype=bool)
+    # Each round refits the detector once, then derives up to `n_seeds` distinct
+    # seeds and searches them all against the FULL data -- capturing several
+    # patterns per detector fit (so ~n_seeds fewer rounds), with no fragmentation.
+    # The K searches per round are independent and can be parallelised.
     misses = 0
     for rnd in range(max_rounds):
         resid = (ytr == 1) & ~covered
@@ -168,33 +194,39 @@ def recover_deep(Xtr, Xva, spec, ytr, yva, covered_tr, *, max_rounds=6,
         Xsc = np.asarray(src[resid_idx])
         if Xraw_tr is None:
             Xsc = Xsc.astype(np.float32)
-        scores = model.predict_proba(Xsc)[:, 1]
-        avail = ~tried[resid_idx]
-        if avail.sum() < min_support:
-            break
-        av_idx, av_sc = resid_idx[avail], scores[avail]
-        seed_rows = av_idx[np.argsort(av_sc)[::-1][:min(seed_n, av_idx.size)]]
-        cols = sorted(int(c) for c in _kl_block(Xtr, seed_rows, hist_all, nb, top_k))
+        seeds = _seed_clusters(model, Xsc, resid_idx, n_seeds, seed_n,
+                               min_support, seed + rnd)
 
-        found = find_rule(cols, resid)
-        if found is None:
-            tried[seed_rows] = True
+        round_hits, seen = [], set()
+        for seed_rows in seeds:
+            if seed_rows.size < min_support:
+                continue
+            cols = sorted(int(c) for c in _kl_block(Xtr, seed_rows, hist_all, nb, top_k))
+            found = find_rule(cols, resid)
+            if found is None:
+                continue
+            key = frozenset(found[0])
+            if key in seen:
+                continue
+            seen.add(key)
+            round_hits.append(found)
+
+        if not round_hits:
             misses += 1
             if verbose:
-                print(f"  [deep r{rnd}] residual={int(resid.sum()):,}  miss "
-                      f"({misses}/{max_misses}) -> re-seed")
+                print(f"  [deep r{rnd}] residual={int(resid.sum()):,}  "
+                      f"miss ({misses}/{max_misses}) over {len(seeds)} seeds")
             if misses >= max_misses:
                 break
             continue
         misses = 0
-        tried[:] = False
-        preds, r, m, new, used_tp = found
-        deep_rules.append(preds)
-        covered |= m
-        info.append(dict(round=rnd, depth=len(preds), new_covered=new,
-                         val_prec=r.val_precision, val_rec=r.val_recall))
+        for preds, r, m, new, used_tp in round_hits:
+            covered |= m
+            deep_rules.append(preds)
+            info.append(dict(round=rnd, depth=len(preds), new_covered=new,
+                             val_prec=r.val_precision, val_rec=r.val_recall))
         if verbose:
-            print(f"  [deep r{rnd}] residual={int(resid.sum()):,}  rule depth "
-                  f"{len(preds)} @P>={used_tp}  covers +{new:,}  "
-                  f"(valP={r.val_precision:.2f})")
+            print(f"  [deep r{rnd}] residual={int(resid.sum()):,}  "
+                  f"{len(round_hits)} rules from {len(seeds)} seeds  "
+                  f"(+{sum(h[3] for h in round_hits):,} frauds)")
     return deep_rules, info
