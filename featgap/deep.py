@@ -44,7 +44,7 @@ def _fit_detector(Xfit, y, *, seed, detector, categorical):
         try:
             import lightgbm as lgb
             m = lgb.LGBMClassifier(
-                n_estimators=150, num_leaves=31, learning_rate=0.08,
+                n_estimators=300, num_leaves=31, learning_rate=0.05,
                 subsample=0.8, subsample_freq=1, colsample_bytree=0.6,
                 class_weight="balanced", n_jobs=-1, random_state=seed,
                 verbosity=-1)
@@ -82,9 +82,9 @@ def _kl_block(Xtr, seed_rows, hist_all, n_bins, top_k, eps=1e-9):
 def recover_deep(Xtr, Xva, spec, ytr, yva, covered_tr, *, max_rounds=6,
                  top_k=16, seed_n=300, target_precision=0.7,
                  min_accept_precision=0.3, max_misses=8,
-                 min_recall=0.01, min_support=40, beam_width=48, max_depth=18,
-                 subsample=40_000, seed=0, detector="lgbm", categorical=None,
-                 Xraw_tr=None, verbose=True):
+                 min_recall=0.01, min_support=40, beam_width=64, max_depth=18,
+                 subsample=80_000, seed=0, detector="lgbm",
+                 categorical=None, Xraw_tr=None, verbose=True):
     """Sequential-covering recovery of deep conjunctions on the residual.
 
     Each round: fit the detector on the still-uncovered frauds, ISOLATE the single
@@ -118,7 +118,7 @@ def recover_deep(Xtr, Xva, spec, ytr, yva, covered_tr, *, max_rounds=6,
     schedule, tp = [], target_precision
     while tp >= min_accept_precision - 1e-9:
         schedule.append(round(tp, 3))
-        tp *= 0.5
+        tp *= 0.7
     yv_col = (yva == 1).astype(np.int64).reshape(-1, 1)
 
     def find_rule(cols, resid):
@@ -138,7 +138,7 @@ def recover_deep(Xtr, Xva, spec, ytr, yva, covered_tr, *, max_rounds=6,
                 if r.val_precision < min_accept_precision:
                     continue
                 preds = tuple((cols[f], op, k) for f, op, k in r.preds)
-                m = rule_mask(preds, Xtr)
+                m = rule_mask(preds, Xtr)             # full-data coverage
                 new = int((m & resid).sum())
                 if best is None or new > best[3]:
                     best = (preds, r, m, new, tp)
@@ -146,50 +146,55 @@ def recover_deep(Xtr, Xva, spec, ytr, yva, covered_tr, *, max_rounds=6,
                 return best
         return best if (best and best[3] >= min_support) else None
 
-    # outer loop = one captured pattern per iteration; the detector is fit ONCE
-    # here and its scores REUSED across re-seed attempts (a miss doesn't change
-    # the residual, so refitting would be wasted work).
-    for cap in range(max_rounds):
+    # Each round refits the detector on the current residual -- the fresh ranking
+    # (model stochasticity + the shrinking residual) is what surfaces the NEXT
+    # pattern, so this is NOT wasted work. On a miss the seed region is marked
+    # tried and we re-seed; reset on a capture (residual changed).
+    tried = np.zeros(len(ytr), dtype=bool)
+    misses = 0
+    for rnd in range(max_rounds):
         resid = (ytr == 1) & ~covered
         resid_idx = np.flatnonzero(resid)
         if resid_idx.size < min_support:
             break
         keep_idx = np.flatnonzero(~((ytr == 1) & covered))
-        rng = np.random.default_rng(seed + cap)
+        rng = np.random.default_rng(seed + rnd)
         sub = rng.choice(keep_idx, min(subsample, len(keep_idx)), replace=False)
         Xfit = np.asarray(src[sub])
         if Xraw_tr is None:
             Xfit = Xfit.astype(np.float32)
-        model = _fit_detector(Xfit, resid[sub].astype(int), seed=seed + cap,
+        model = _fit_detector(Xfit, resid[sub].astype(int), seed=seed + rnd,
                               detector=detector, categorical=categorical)
         Xsc = np.asarray(src[resid_idx])
         if Xraw_tr is None:
             Xsc = Xsc.astype(np.float32)
-        order = resid_idx[np.argsort(model.predict_proba(Xsc)[:, 1])[::-1]]
-
-        # try successive score-ranked seed windows until one yields a rule
-        found = None
-        for att in range(max_misses):
-            lo = att * seed_n
-            if lo + min_support > order.size:
-                break
-            seed_rows = order[lo:lo + seed_n]
-            cols = sorted(int(c) for c in _kl_block(Xtr, seed_rows, hist_all, nb, top_k))
-            found = find_rule(cols, resid)
-            if found is not None:
-                break
-        if found is None:
-            if verbose:
-                print(f"  [deep] residual={int(resid.sum()):,}  no clean pattern "
-                      f"in {max_misses} seed windows -> stop")
+        scores = model.predict_proba(Xsc)[:, 1]
+        avail = ~tried[resid_idx]
+        if avail.sum() < min_support:
             break
+        av_idx, av_sc = resid_idx[avail], scores[avail]
+        seed_rows = av_idx[np.argsort(av_sc)[::-1][:min(seed_n, av_idx.size)]]
+        cols = sorted(int(c) for c in _kl_block(Xtr, seed_rows, hist_all, nb, top_k))
+
+        found = find_rule(cols, resid)
+        if found is None:
+            tried[seed_rows] = True
+            misses += 1
+            if verbose:
+                print(f"  [deep r{rnd}] residual={int(resid.sum()):,}  miss "
+                      f"({misses}/{max_misses}) -> re-seed")
+            if misses >= max_misses:
+                break
+            continue
+        misses = 0
+        tried[:] = False
         preds, r, m, new, used_tp = found
         deep_rules.append(preds)
         covered |= m
-        info.append(dict(round=cap, depth=len(preds), new_covered=new,
+        info.append(dict(round=rnd, depth=len(preds), new_covered=new,
                          val_prec=r.val_precision, val_rec=r.val_recall))
         if verbose:
-            print(f"  [deep {cap}] residual={int(resid.sum()):,}  rule depth "
+            print(f"  [deep r{rnd}] residual={int(resid.sum()):,}  rule depth "
                   f"{len(preds)} @P>={used_tp}  covers +{new:,}  "
-                  f"(valP={r.val_precision:.2f}, att={att})")
+                  f"(valP={r.val_precision:.2f})")
     return deep_rules, info
