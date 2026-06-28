@@ -27,22 +27,48 @@ from featgap import recover_deep
 from experiments.stress import make_stress, encode, report, strata, peak_gb
 
 
-def partition(Xtr_b, ytr, K, seed, top_m=60, sub_n=80_000):
-    """Pattern-aware fraud partition: one detector fit -> top features -> KMeans
-    on the fraud rows. Returns (fraud_idx, top_features, kmeans)."""
+def partition(Xtr_b, ytr, K, seed, method="leaf", top_m=60, sub_n=80_000):
+    """Pattern-aware fraud partition. Returns (fraud_idx, assign_fn) where
+    assign_fn(Xb, idx) -> cluster labels for rows idx of binned matrix Xb.
+
+    method="leaf" (default): cluster frauds by which LightGBM LEAVES they fall in
+      -- subspace-aware, so same-pattern frauds (routed through the same tree
+      paths) stay together even when they match on only a few of many features.
+    method="kmeans": KMeans on the top-importance feature values (full-space;
+      fragments patterns that share features -- kept for comparison).
+    """
     import lightgbm as lgb
-    from sklearn.cluster import KMeans
     rng = np.random.default_rng(seed)
     sub = rng.choice(len(ytr), min(sub_n, len(ytr)), replace=False)
     det = lgb.LGBMClassifier(n_estimators=150, num_leaves=31, learning_rate=0.08,
                              class_weight="balanced", n_jobs=-1, random_state=seed,
                              importance_type="gain", verbosity=-1)
     det.fit(np.asarray(Xtr_b[sub]).astype(np.float32), ytr[sub])
-    top = np.argsort(det.feature_importances_)[::-1][:top_m]
     fr = np.flatnonzero(ytr == 1)
-    Xf = np.asarray(Xtr_b[fr][:, top]).astype(np.float32)
-    km = KMeans(K, n_init=4, random_state=seed).fit(Xf)
-    return fr, top, km
+
+    if method == "leaf":
+        from sklearn.cluster import MiniBatchKMeans
+        from sklearn.preprocessing import OneHotEncoder
+        leaves = det.booster_.predict(np.asarray(Xtr_b[fr]).astype(np.float32),
+                                      pred_leaf=True)
+        enc = OneHotEncoder(handle_unknown="ignore").fit(leaves)
+        km = MiniBatchKMeans(K, n_init=4, random_state=seed,
+                             batch_size=2048).fit(enc.transform(leaves))
+
+        def assign(Xb, idx):
+            lv = det.booster_.predict(np.asarray(Xb[idx]).astype(np.float32),
+                                      pred_leaf=True)
+            return km.predict(enc.transform(lv))
+        return fr, assign
+
+    from sklearn.cluster import KMeans
+    top = np.argsort(det.feature_importances_)[::-1][:top_m]
+    km = KMeans(K, n_init=4, random_state=seed).fit(
+        np.asarray(Xtr_b[fr][:, top]).astype(np.float32))
+
+    def assign(Xb, idx):
+        return km.predict(np.asarray(Xb[idx][:, top]).astype(np.float32))
+    return fr, assign
 
 
 def run(n=500_000, n_features=200, n_patterns=100, K=6, seed=0):
@@ -62,10 +88,10 @@ def run(n=500_000, n_features=200, n_patterns=100, K=6, seed=0):
 
     # ---- partition ----
     t0 = time.perf_counter()
-    fr_tr, top, km = partition(Xtr_b, ytr, K, seed)
-    cl_tr = km.predict(np.asarray(Xtr_b[fr_tr][:, top]).astype(np.float32))
+    fr_tr, assign = partition(Xtr_b, ytr, K, seed)
+    cl_tr = assign(Xtr_b, fr_tr)
     fr_va = np.flatnonzero(yva == 1)
-    cl_va = km.predict(np.asarray(Xva_b[fr_va][:, top]).astype(np.float32))
+    cl_va = assign(Xva_b, fr_va)
     t_part = time.perf_counter() - t0
     sizes = [int((cl_tr == k).sum()) for k in range(K)]
     print(f"  [partition {t_part:.0f}s]  arm fraud sizes: {sizes}")
@@ -76,12 +102,14 @@ def run(n=500_000, n_features=200, n_patterns=100, K=6, seed=0):
     for k in range(K):
         ytr_k = np.zeros(len(ytr), dtype=np.int64); ytr_k[fr_tr[cl_tr == k]] = 1
         yva_k = np.zeros(len(yva), dtype=np.int64); yva_k[fr_va[cl_va == k]] = 1
+        # arms are de-souped, so patterns are prominent -> LIGHT settings suffice
+        # (lighter detector subsample, fewer misses, narrower/shallower search)
         t0 = time.perf_counter()
         deep, _ = recover_deep(
-            Xtr_b, Xva_b, spec, ytr_k, yva_k, empty, max_rounds=60, top_k=22,
-            seed_n=250, target_precision=0.6, min_accept_precision=0.12,
-            max_misses=10, min_recall=0.01, min_support=20, beam_width=64,
-            max_depth=18, seed=seed, verbose=False)
+            Xtr_b, Xva_b, spec, ytr_k, yva_k, empty, max_rounds=25, top_k=20,
+            seed_n=200, target_precision=0.6, min_accept_precision=0.12,
+            max_misses=5, min_recall=0.01, min_support=20, beam_width=40,
+            max_depth=14, subsample=40_000, seed=seed, verbose=False)
         dt = time.perf_counter() - t0
         arm_times.append(dt); arm_rules.append(len(deep)); all_preds += deep
         print(f"  arm {k}: {sizes[k]:>5} frauds -> {len(deep):>2} rules  [{dt:.0f}s]")
