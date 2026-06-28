@@ -243,7 +243,7 @@ def run(n=500_000, n_features=200, n_patterns=100, bad_rate=0.02, seed=0):
     # ---- baseline F1 beam ----
     t0 = time.perf_counter()
     base, _ = targeted_beam_search(
-        Xtr_b, ytr.reshape(-1, 1), 0, spec, min_recall=0.004, target_precision=0.5,
+        Xtr_b, ytr.reshape(-1, 1), 0, spec, min_recall=0.004, target_precision=0.4,
         min_support=min_support, beam_width=40, max_depth=12,
         Xbin_val=Xva_b, Y_val=yva.reshape(-1, 1), gap_tol=None)
     base_preds = [r.preds for r in base]
@@ -254,9 +254,9 @@ def run(n=500_000, n_features=200, n_patterns=100, bad_rate=0.02, seed=0):
     t0 = time.perf_counter()
     _, cov_tr = uncovered_positives(base, Xtr_b, ytr)
     deep, infos = recover_deep(Xtr_b, Xva_b, spec, ytr, yva, cov_tr, max_rounds=40,
-                               top_k=40, target_precision=0.6, min_recall=0.004,
-                               min_support=min_support, beam_width=64, max_depth=18,
-                               seed=seed, verbose=False)
+                               top_k=40, target_precision=0.55, precision_floor=0.2,
+                               min_recall=0.004, min_support=min_support,
+                               beam_width=64, max_depth=18, seed=seed, verbose=True)
     print(f"  [recover_deep {time.perf_counter()-t0:.0f}s]  "
           f"{len(deep)} deep rules over {len(infos)} rounds")
     rec1, prec1, pcov1 = report("1. + recover_deep", base_preds + deep, Xva_b, yva, mo_va)

@@ -64,7 +64,8 @@ def _importance_block(Xfit, y, *, top_k, seed, detector="lgbm", categorical=None
 
 
 def recover_deep(Xtr, Xva, spec, ytr, yva, covered_tr, *, max_rounds=6,
-                 top_k=40, target_precision=0.7, min_recall=0.01, min_support=40,
+                 top_k=40, target_precision=0.7, precision_floor=0.2,
+                 min_recall=0.01, min_support=40,
                  beam_width=64, max_depth=18, subsample=80_000, seed=0,
                  detector="lgbm", categorical=None, Xraw_tr=None, verbose=True):
     """Sequential-covering recovery of deep conjunctions on the residual.
@@ -73,6 +74,13 @@ def recover_deep(Xtr, Xva, spec, ytr, yva, covered_tr, *, max_rounds=6,
     round: fit the joint detector on the still-uncovered frauds, restrict to its
     top-`top_k` features, run an F1 beam there (high precision target forces full
     conjunction growth), accept the best rule(s), and subtract their coverage.
+
+    With MANY overlapping patterns the detector's top-k block is a mix, so a
+    high precision target can find no clean rule and stall sequential covering.
+    Each round therefore RELAXES the precision target (`target_precision` down to
+    `precision_floor`) until the restricted search yields a rule covering new
+    frauds -- a contaminated pattern still gets a (lower-precision) rule and the
+    next round proceeds on a cleaner residual.
 
     detector: "lgbm" (default, scalable + native missing/categorical) or "rf".
     Xraw_tr: optional raw (unbinned) train feature matrix for the DETECTOR only --
@@ -104,26 +112,34 @@ def recover_deep(Xtr, Xva, spec, ytr, yva, covered_tr, *, max_rounds=6,
         cols = sorted(int(c) for c in block)
         sub_spec = BinSpec([spec.edges[c] for c in cols], spec.pct, spec.n_bins)
         Xt, Xv = Xtr[:, cols], Xva[:, cols]
-        rules, _ = targeted_beam_search(
-            Xt, resid.astype(np.int64).reshape(-1, 1), 0, sub_spec,
-            min_recall=min_recall, target_precision=target_precision,
-            min_support=min_support, beam_width=beam_width, max_depth=max_depth,
-            Xbin_val=Xv, Y_val=(yva == 1).astype(np.int64).reshape(-1, 1),
-            gap_tol=None, rank_by="f1")
-        if not rules:
+        yv_col = (yva == 1).astype(np.int64).reshape(-1, 1)
+        resid_col = resid.astype(np.int64).reshape(-1, 1)
+
+        # relax the precision target until a rule covering new frauds appears
+        schedule, tp = [], target_precision
+        while tp >= precision_floor - 1e-9:
+            schedule.append(round(tp, 3))
+            tp *= 0.66
+        best, best_new, used_tp = None, 0, None
+        for tp in schedule:
+            rules, _ = targeted_beam_search(
+                Xt, resid_col, 0, sub_spec, min_recall=min_recall,
+                target_precision=tp, min_support=min_support,
+                beam_width=beam_width, max_depth=max_depth,
+                Xbin_val=Xv, Y_val=yv_col, gap_tol=None, rank_by="f1")
+            for r in rules:
+                preds = tuple((cols[f], op, k) for f, op, k in r.preds)
+                m = rule_mask(preds, Xtr)
+                new = int((m & resid).sum())
+                if new > best_new:
+                    best, best_new, used_tp = (preds, r, m), new, tp
+            if best is not None and best_new >= min_support:
+                break
+        if best is None or best_new < min_support:
             if verbose:
                 print(f"  [deep r{rnd}] residual={int(resid.sum()):,}  "
-                      f"no rule over top-{top_k} block -> stop")
-            break
-        # remap to original feature indices, pick the rule with most NEW coverage
-        best, best_new = None, 0
-        for r in rules:
-            preds = tuple((cols[f], op, k) for f, op, k in r.preds)
-            m = rule_mask(preds, Xtr)
-            new = int((m & resid).sum())
-            if new > best_new:
-                best, best_new = (preds, r, m), new
-        if best is None or best_new < min_support:
+                      f"no rule over top-{top_k} block (down to P={schedule[-1]}) "
+                      f"-> stop")
             break
         preds, r, m = best
         deep_rules.append(preds)
@@ -132,6 +148,7 @@ def recover_deep(Xtr, Xva, spec, ytr, yva, covered_tr, *, max_rounds=6,
                          val_prec=r.val_precision, val_rec=r.val_recall))
         if verbose:
             print(f"  [deep r{rnd}] residual={int(resid.sum()):,}  detected "
-                  f"block top-{top_k} ({detector})  -> rule depth {len(preds)}  "
-                  f"covers +{best_new:,} frauds  (valP={r.val_precision:.2f})")
+                  f"block top-{top_k} ({detector})  -> rule depth {len(preds)} "
+                  f"@P>={used_tp}  covers +{best_new:,} frauds  "
+                  f"(valP={r.val_precision:.2f})")
     return deep_rules, info
