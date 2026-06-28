@@ -250,17 +250,18 @@ def run(n=500_000, n_features=200, n_patterns=100, bad_rate=0.02, seed=0):
     print(f"\n  [baseline F1 beam {time.perf_counter()-t0:.0f}s]")
     rec0, prec0, pcov0 = report("0. baseline", base_preds, Xva_b, yva, mo_va)
 
-    # ---- recover_deep (sequential covering, LightGBM detector) ----
+    # ---- recover_deep as PURE sequential covering (from scratch) so isolation
+    #      handles shallow patterns too, not just the baseline's residual ----
     t0 = time.perf_counter()
-    _, cov_tr = uncovered_positives(base, Xtr_b, ytr)
-    deep, infos = recover_deep(Xtr_b, Xva_b, spec, ytr, yva, cov_tr, max_rounds=80,
+    empty = np.zeros(len(ytr), dtype=bool)
+    deep, infos = recover_deep(Xtr_b, Xva_b, spec, ytr, yva, empty, max_rounds=120,
                                top_k=22, seed_n=250, target_precision=0.6,
-                               min_accept_precision=0.3, max_misses=15,
+                               min_accept_precision=0.12, max_misses=15,
                                min_recall=0.004, min_support=20,
                                beam_width=64, max_depth=18, seed=seed, verbose=True)
-    print(f"  [recover_deep {time.perf_counter()-t0:.0f}s]  "
-          f"{len(deep)} deep rules over {len(infos)} rounds")
-    rec1, prec1, pcov1 = report("1. + recover_deep", base_preds + deep, Xva_b, yva, mo_va)
+    print(f"  [recover_deep(scratch) {time.perf_counter()-t0:.0f}s]  "
+          f"{len(deep)} rules over {len(infos)} captured rounds")
+    rec1, prec1, pcov1 = report("1. sequential covering", deep, Xva_b, yva, mo_va)
 
     strata(patterns, np.maximum(pcov0, pcov1))
     print(f"\n  TOTAL {time.perf_counter()-t_all:.0f}s   peak RSS {peak_gb():.2f} GB")
