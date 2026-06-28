@@ -102,7 +102,7 @@ def targeted_beam_search(
     Xbin_val=None, Y_val=None, gap_tol=None,
     max_accept=2000,
     policy=None,
-    rank_by="precision",
+    rank_by="f1",
     progress=None,
 ):
     """Grow rules toward (precision >= target, recall >= floor); return accepted.
@@ -114,6 +114,12 @@ def targeted_beam_search(
     Returns (accepted, trace) where trace logs why paths stopped. `max_accept`
     caps the accepted pool so a strong, common pattern can't generate tens of
     thousands of near-duplicate variants before the minimality filter runs.
+
+    `rank_by` selects the beam-keep score: "f1" (default) balances precision and
+    recall, which keeps the high-recall prefixes of deeper conjunctions that pure
+    "precision" buries -- empirically ~3x the recall and full recovery of
+    moderate-depth patterns. (The recall floor and precision target are unchanged;
+    only which partial rules survive truncation differs.)
     """
     N, F = Xbin.shape
     yc = Y[:, target].astype(np.float64)

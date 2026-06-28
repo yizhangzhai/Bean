@@ -20,9 +20,11 @@ geometry/synthesize -> re-mine. Stop as soon as the gap is explained.
 from .gap import uncovered_positives, remine_residual
 from .screen import mutual_information, interaction_screen, hsic
 from .synthesize import best_band, ring_score, propose_features
+from .deep import recover_deep
 
 __all__ = [
     "uncovered_positives", "remine_residual",
     "mutual_information", "interaction_screen", "hsic",
     "best_band", "ring_score", "propose_features",
+    "recover_deep",
 ]
