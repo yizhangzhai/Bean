@@ -102,6 +102,7 @@ def targeted_beam_search(
     Xbin_val=None, Y_val=None, gap_tol=None,
     max_accept=2000,
     policy=None,
+    rank_by="precision",
     progress=None,
 ):
     """Grow rules toward (precision >= target, recall >= floor); return accepted.
@@ -158,11 +159,18 @@ def targeted_beam_search(
                 r.stop_reason = "precision target met"
                 accepted.append(r)
         # rank grow candidates on train precision (minus a soft penalty for
-        # discouraged feature co-occurrence), gap-check only the top beam
+        # discouraged feature co-occurrence), gap-check only the top beam.
+        # rank_by="f1" instead balances precision & recall -- which rewards the
+        # high-recall prefixes of deep conjunctions that pure precision buries.
         def rkey(r):
             pen = (policy.rule_penalty({f for f, _, _ in r.preds})
                    if policy is not None else 0.0)
-            return (r.precision - pen, r.recall)
+            if rank_by == "f1":
+                P, R = r.precision, r.recall
+                base = 2 * P * R / (P + R) if (P + R) > 0 else 0.0
+            else:
+                base = r.precision
+            return (base - pen, r.recall)
         grow_cands.sort(key=rkey, reverse=True)
         beam = []
         for r in grow_cands:
