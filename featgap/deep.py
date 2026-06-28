@@ -44,7 +44,7 @@ def _fit_detector(Xfit, y, *, seed, detector, categorical):
         try:
             import lightgbm as lgb
             m = lgb.LGBMClassifier(
-                n_estimators=300, num_leaves=31, learning_rate=0.05,
+                n_estimators=150, num_leaves=31, learning_rate=0.08,
                 subsample=0.8, subsample_freq=1, colsample_bytree=0.6,
                 class_weight="balanced", n_jobs=-1, random_state=seed,
                 verbosity=-1)
@@ -82,8 +82,8 @@ def _kl_block(Xtr, seed_rows, hist_all, n_bins, top_k, eps=1e-9):
 def recover_deep(Xtr, Xva, spec, ytr, yva, covered_tr, *, max_rounds=6,
                  top_k=16, seed_n=300, target_precision=0.7,
                  min_accept_precision=0.3, max_misses=8,
-                 min_recall=0.01, min_support=40, beam_width=64, max_depth=18,
-                 subsample=80_000, seed=0, detector="lgbm", categorical=None,
+                 min_recall=0.01, min_support=40, beam_width=48, max_depth=18,
+                 subsample=40_000, seed=0, detector="lgbm", categorical=None,
                  Xraw_tr=None, verbose=True):
     """Sequential-covering recovery of deep conjunctions on the residual.
 
@@ -111,51 +111,23 @@ def recover_deep(Xtr, Xva, spec, ytr, yva, covered_tr, *, max_rounds=6,
     src = Xraw_tr if Xraw_tr is not None else Xtr
     nb = spec.n_bins
     F = Xtr.shape[1]
-    tried = np.zeros(len(ytr), dtype=bool)        # seed regions already exhausted
-    misses = 0
-    # overall per-feature bin distribution (KL baseline), computed once
-    hist_all = []
+    hist_all = []                                  # overall bin dist (KL baseline)
     for f in range(F):
         h = np.bincount(np.asarray(Xtr[:, f]), minlength=nb).astype(float)
         hist_all.append(h / max(1.0, h.sum()))
     schedule, tp = [], target_precision
     while tp >= min_accept_precision - 1e-9:
         schedule.append(round(tp, 3))
-        tp *= 0.7
+        tp *= 0.5
     yv_col = (yva == 1).astype(np.int64).reshape(-1, 1)
 
-    for rnd in range(max_rounds):
-        resid = (ytr == 1) & ~covered
-        resid_idx = np.flatnonzero(resid)
-        if resid_idx.size < min_support:
-            break
-        keep_idx = np.flatnonzero(~((ytr == 1) & covered))
-        rng = np.random.default_rng(seed + rnd)
-        sub = rng.choice(keep_idx, min(subsample, len(keep_idx)), replace=False)
-        Xfit = np.asarray(src[sub])
-        if Xraw_tr is None:
-            Xfit = Xfit.astype(np.float32)
-        model = _fit_detector(Xfit, resid[sub].astype(int), seed=seed + rnd,
-                              detector=detector, categorical=categorical)
-
-        # seed = top-scoring uncovered frauds NOT yet tried (isolate ONE pattern)
-        Xsc = np.asarray(src[resid_idx])
-        if Xraw_tr is None:
-            Xsc = Xsc.astype(np.float32)
-        scores = model.predict_proba(Xsc)[:, 1]
-        avail = ~tried[resid_idx]
-        if avail.sum() < min_support:
-            break
-        av_idx, av_sc = resid_idx[avail], scores[avail]
-        seed_rows = av_idx[np.argsort(av_sc)[::-1][:min(seed_n, av_idx.size)]]
-        cols = sorted(int(c) for c in _kl_block(Xtr, seed_rows, hist_all, nb, top_k))
+    def find_rule(cols, resid):
+        """Relax precision target; return best (preds,r,mask,new,tp) with held-out
+        precision >= min_accept_precision, else None."""
         sub_spec = BinSpec([spec.edges[c] for c in cols], spec.pct, nb)
         Xt, Xv = Xtr[:, cols], Xva[:, cols]
         resid_col = resid.astype(np.int64).reshape(-1, 1)
-
-        # relax precision target; ACCEPT only rules whose held-out precision clears
-        # min_accept_precision (reject tail dragnets)
-        best, best_new, used_tp = None, 0, None
+        best = None
         for tp in schedule:
             rules, _ = targeted_beam_search(
                 Xt, resid_col, 0, sub_spec, min_recall=min_recall,
@@ -168,30 +140,56 @@ def recover_deep(Xtr, Xva, spec, ytr, yva, covered_tr, *, max_rounds=6,
                 preds = tuple((cols[f], op, k) for f, op, k in r.preds)
                 m = rule_mask(preds, Xtr)
                 new = int((m & resid).sum())
-                if new > best_new:
-                    best, best_new, used_tp = (preds, r, m), new, tp
-            if best is not None and best_new >= min_support:
-                break
+                if best is None or new > best[3]:
+                    best = (preds, r, m, new, tp)
+            if best is not None and best[3] >= min_support:
+                return best
+        return best if (best and best[3] >= min_support) else None
 
-        if best is None or best_new < min_support:
-            tried[seed_rows] = True                # exhaust this region, re-seed
-            misses += 1
+    # outer loop = one captured pattern per iteration; the detector is fit ONCE
+    # here and its scores REUSED across re-seed attempts (a miss doesn't change
+    # the residual, so refitting would be wasted work).
+    for cap in range(max_rounds):
+        resid = (ytr == 1) & ~covered
+        resid_idx = np.flatnonzero(resid)
+        if resid_idx.size < min_support:
+            break
+        keep_idx = np.flatnonzero(~((ytr == 1) & covered))
+        rng = np.random.default_rng(seed + cap)
+        sub = rng.choice(keep_idx, min(subsample, len(keep_idx)), replace=False)
+        Xfit = np.asarray(src[sub])
+        if Xraw_tr is None:
+            Xfit = Xfit.astype(np.float32)
+        model = _fit_detector(Xfit, resid[sub].astype(int), seed=seed + cap,
+                              detector=detector, categorical=categorical)
+        Xsc = np.asarray(src[resid_idx])
+        if Xraw_tr is None:
+            Xsc = Xsc.astype(np.float32)
+        order = resid_idx[np.argsort(model.predict_proba(Xsc)[:, 1])[::-1]]
+
+        # try successive score-ranked seed windows until one yields a rule
+        found = None
+        for att in range(max_misses):
+            lo = att * seed_n
+            if lo + min_support > order.size:
+                break
+            seed_rows = order[lo:lo + seed_n]
+            cols = sorted(int(c) for c in _kl_block(Xtr, seed_rows, hist_all, nb, top_k))
+            found = find_rule(cols, resid)
+            if found is not None:
+                break
+        if found is None:
             if verbose:
-                print(f"  [deep r{rnd}] residual={int(resid.sum()):,}  miss "
-                      f"({misses}/{max_misses}) on block {cols[:5]}... -> re-seed")
-            if misses >= max_misses:
-                break
-            continue
-
-        misses = 0
-        tried[:] = False                           # residual changed; reset hunt
-        preds, r, m = best
+                print(f"  [deep] residual={int(resid.sum()):,}  no clean pattern "
+                      f"in {max_misses} seed windows -> stop")
+            break
+        preds, r, m, new, used_tp = found
         deep_rules.append(preds)
         covered |= m
-        info.append(dict(round=rnd, depth=len(preds), new_covered=best_new,
+        info.append(dict(round=cap, depth=len(preds), new_covered=new,
                          val_prec=r.val_precision, val_rec=r.val_recall))
         if verbose:
-            print(f"  [deep r{rnd}] residual={int(resid.sum()):,}  isolated "
-                  f"{top_k}-feat block -> rule depth {len(preds)} @P>={used_tp}  "
-                  f"covers +{best_new:,}  (valP={r.val_precision:.2f})")
+            print(f"  [deep {cap}] residual={int(resid.sum()):,}  rule depth "
+                  f"{len(preds)} @P>={used_tp}  covers +{new:,}  "
+                  f"(valP={r.val_precision:.2f}, att={att})")
     return deep_rules, info
