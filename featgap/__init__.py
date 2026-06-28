@@ -12,6 +12,9 @@ and handles what the rules CANNOT express on the given features:
                 finds interactions with no marginal signal.
   synthesize.py diagnose geometry (topology-lite ring/void) and synthesize +
                 rank candidate features (radial / ratio / diff) for re-mining.
+  deep.py       recover DEEP conjunctions a greedy beam can't seed: a joint model
+                (LightGBM / RandomForest) on the residual scopes the feature
+                block, then an F1 beam refines the exact rule (sequential covering).
 
 Recommended triage (cheap -> fancy): re-mine residual -> interaction screen ->
 geometry/synthesize -> re-mine. Stop as soon as the gap is explained.

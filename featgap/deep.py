@@ -6,15 +6,23 @@ random broad rule, so no single-rule score (precision, recall, F1) can single it
 out, and the one steep shallow pattern monopolizes the beam.
 
 The signal IS there, but only JOINTLY. So we detect the relevant feature block
-with a joint model (gradient-boosted / random-forest importances on the residual)
-and then REFINE: run the rule search restricted to that handful of features,
-where the conjunction is no longer drowned. Sequential covering peels one pattern
-at a time -- fit on the residual, find the strongest remaining conjunction over
-its features, remove the frauds it covers, repeat.
+with a joint model (a gradient-boosted tree on the residual -- its gain importance
+surfaces the conjunction's features even when each is marginally weak) and then
+REFINE: run the rule search restricted to that handful of features, where the
+conjunction is no longer drowned. Sequential covering peels one pattern at a time
+-- fit on the residual, find the strongest remaining conjunction over its
+features, remove the frauds it covers, repeat.
 
     detect (joint model) -> restrict (top-K features) -> refine (F1 beam) -> cover
 
-Depends on `arp` (one-directional) and, optionally, scikit-learn for the detector.
+The detector is the SCOPE oracle, not the rule source (its own tree paths are
+noisy/fragmented); the interpretable, policy-eligible rule is produced by the
+refine step. Default detector is LightGBM -- histogram-based so it scales to high
+dimension, handles missing values natively (NaN routed to a learned direction),
+and takes categorical features directly (no one-hot) -- with a scikit-learn
+RandomForest fallback if LightGBM is absent.
+
+Depends on `arp` (one-directional); LightGBM / scikit-learn are optional.
 """
 
 from __future__ import annotations
@@ -25,25 +33,40 @@ from arp.fast import rule_mask, BinSpec
 from arp.targeted import targeted_beam_search
 
 
-def _importance_block(Xtr, y_resid, *, top_k, subsample, seed):
-    """Joint detector: features most responsible for the residual, by RandomForest
-    importance (it splits on the conjunction's features even when each is
-    marginally weak). Returns the original-index feature block."""
+def _importance_block(Xfit, y, *, top_k, seed, detector="lgbm", categorical=None):
+    """Joint detector -> indices of the top-`top_k` features by gain importance.
+
+    `Xfit` may contain NaN (LightGBM handles it natively). `categorical` is an
+    optional list of column indices to treat as categorical (LightGBM only;
+    columns must be integer-coded). Returns (block_indices, importances)."""
+    if detector == "lgbm":
+        try:
+            import lightgbm as lgb
+            model = lgb.LGBMClassifier(
+                n_estimators=300, num_leaves=31, learning_rate=0.05,
+                subsample=0.8, subsample_freq=1, colsample_bytree=0.6,
+                class_weight="balanced", n_jobs=-1, random_state=seed,
+                importance_type="gain", verbosity=-1)
+            fit_kw = {}
+            if categorical:
+                fit_kw["categorical_feature"] = list(categorical)
+            model.fit(Xfit, y, **fit_kw)
+            imp = np.asarray(model.feature_importances_, dtype=float)
+            return np.argsort(imp)[::-1][:top_k], imp
+        except ImportError:
+            pass                                   # fall through to RandomForest
     from sklearn.ensemble import RandomForestClassifier
-    rng = np.random.default_rng(seed)
-    n = Xtr.shape[0]
-    idx = rng.choice(n, min(subsample, n), replace=False)
-    rf = RandomForestClassifier(n_estimators=120, max_depth=None,
-                                n_jobs=-1, random_state=seed, max_features="sqrt")
-    rf.fit(np.asarray(Xtr[idx]).astype(np.float32), y_resid[idx])
-    imp = rf.feature_importances_
+    rf = RandomForestClassifier(n_estimators=120, n_jobs=-1, random_state=seed,
+                                max_features="sqrt", class_weight="balanced")
+    rf.fit(np.nan_to_num(np.asarray(Xfit, dtype=np.float32)), y)   # RF needs no NaN
+    imp = np.asarray(rf.feature_importances_, dtype=float)
     return np.argsort(imp)[::-1][:top_k], imp
 
 
 def recover_deep(Xtr, Xva, spec, ytr, yva, covered_tr, *, max_rounds=6,
                  top_k=40, target_precision=0.7, min_recall=0.01, min_support=40,
                  beam_width=64, max_depth=18, subsample=80_000, seed=0,
-                 verbose=True):
+                 detector="lgbm", categorical=None, Xraw_tr=None, verbose=True):
     """Sequential-covering recovery of deep conjunctions on the residual.
 
     `covered_tr` is the train mask already covered by the baseline rules. Each
@@ -51,32 +74,40 @@ def recover_deep(Xtr, Xva, spec, ytr, yva, covered_tr, *, max_rounds=6,
     top-`top_k` features, run an F1 beam there (high precision target forces full
     conjunction growth), accept the best rule(s), and subtract their coverage.
 
-    Returns (deep_rules, info) where each rule's predicate feature indices are in
-    the ORIGINAL feature space, ready to apply with arp.fast.rule_mask.
+    detector: "lgbm" (default, scalable + native missing/categorical) or "rf".
+    Xraw_tr: optional raw (unbinned) train feature matrix for the DETECTOR only --
+      pass it to let LightGBM exploit real NaN / categorical columns; the rule
+      refine always runs on the binned `Xtr`. If None, the detector uses `Xtr`.
+    categorical: column indices to treat as categorical in the detector (LightGBM).
+
+    Returns (deep_rules, info); each rule's predicate feature indices are in the
+    ORIGINAL feature space, ready to apply with arp.fast.rule_mask.
     """
     covered = covered_tr.copy()
     deep_rules, info = [], []
-    pos_all = int((ytr == 1).sum())
+    src = Xraw_tr if Xraw_tr is not None else Xtr
 
     for rnd in range(max_rounds):
         resid = (ytr == 1) & ~covered
         if resid.sum() < min_support:
             break
-        keep = ~((ytr == 1) & covered)              # drop already-covered frauds
-        Xk = Xtr[keep]
-        y_resid = resid[keep].astype(int)
+        keep_idx = np.flatnonzero(~((ytr == 1) & covered))    # drop covered frauds
+        rng = np.random.default_rng(seed + rnd)
+        sub = rng.choice(keep_idx, min(subsample, len(keep_idx)), replace=False)
+        Xfit = np.asarray(src[sub])
+        if Xraw_tr is None:
+            Xfit = Xfit.astype(np.float32)
+        y_sub = resid[sub].astype(int)
 
-        block, imp = _importance_block(Xk, y_resid, top_k=top_k,
-                                       subsample=subsample, seed=seed + rnd)
-        # restrict to the detected block (search in this small space only)
+        block, _ = _importance_block(Xfit, y_sub, top_k=top_k, seed=seed + rnd,
+                                     detector=detector, categorical=categorical)
         cols = sorted(int(c) for c in block)
         sub_spec = BinSpec([spec.edges[c] for c in cols], spec.pct, spec.n_bins)
         Xt, Xv = Xtr[:, cols], Xva[:, cols]
-        y_resid_full = resid.astype(np.int64)        # target = uncovered frauds
         rules, _ = targeted_beam_search(
-            Xt, y_resid_full.reshape(-1, 1), 0, sub_spec, min_recall=min_recall,
-            target_precision=target_precision, min_support=min_support,
-            beam_width=beam_width, max_depth=max_depth,
+            Xt, resid.astype(np.int64).reshape(-1, 1), 0, sub_spec,
+            min_recall=min_recall, target_precision=target_precision,
+            min_support=min_support, beam_width=beam_width, max_depth=max_depth,
             Xbin_val=Xv, Y_val=(yva == 1).astype(np.int64).reshape(-1, 1),
             gap_tol=None, rank_by="f1")
         if not rules:
@@ -84,7 +115,7 @@ def recover_deep(Xtr, Xva, spec, ytr, yva, covered_tr, *, max_rounds=6,
                 print(f"  [deep r{rnd}] residual={int(resid.sum()):,}  "
                       f"no rule over top-{top_k} block -> stop")
             break
-        # remap to original feature indices, pick the best by NEW coverage
+        # remap to original feature indices, pick the rule with most NEW coverage
         best, best_new = None, 0
         for r in rules:
             preds = tuple((cols[f], op, k) for f, op, k in r.preds)
@@ -97,11 +128,10 @@ def recover_deep(Xtr, Xva, spec, ytr, yva, covered_tr, *, max_rounds=6,
         preds, r, m = best
         deep_rules.append(preds)
         covered |= m
-        depth = len(preds)
-        info.append(dict(round=rnd, depth=depth, new_covered=best_new,
+        info.append(dict(round=rnd, depth=len(preds), new_covered=best_new,
                          val_prec=r.val_precision, val_rec=r.val_recall))
         if verbose:
             print(f"  [deep r{rnd}] residual={int(resid.sum()):,}  detected "
-                  f"block top-{top_k}  -> rule depth {depth}  "
+                  f"block top-{top_k} ({detector})  -> rule depth {len(preds)}  "
                   f"covers +{best_new:,} frauds  (valP={r.val_precision:.2f})")
     return deep_rules, info
