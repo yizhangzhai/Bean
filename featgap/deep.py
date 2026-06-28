@@ -135,8 +135,8 @@ def recover_deep(Xtr, Xva, spec, ytr, yva, covered_tr, *, max_rounds=6,
                  top_k=16, seed_n=300, n_seeds=1, target_precision=0.7,
                  min_accept_precision=0.3, max_misses=8,
                  min_recall=0.01, min_support=40, beam_width=64, max_depth=18,
-                 subsample=80_000, n_jobs=1, seed=0, detector="lgbm",
-                 categorical=None, Xraw_tr=None, verbose=True):
+                 subsample=80_000, n_jobs=1, min_round_gain=0, seed=0,
+                 detector="lgbm", categorical=None, Xraw_tr=None, verbose=True):
     """Sequential-covering recovery of deep conjunctions on the residual.
 
     Each round: fit the detector on the still-uncovered frauds, ISOLATE the single
@@ -247,14 +247,18 @@ def recover_deep(Xtr, Xva, spec, ytr, yva, covered_tr, *, max_rounds=6,
             if misses >= max_misses:
                 break
             continue
-        misses = 0
         for preds, vp, vr, m, new in round_hits:
             covered |= m
             deep_rules.append(preds)
             info.append(dict(round=rnd, depth=len(preds), new_covered=new,
                              val_prec=vp, val_rec=vr))
+        round_gain = sum(h[4] for h in round_hits)
+        # a low-yield round (only the unmineable tail left) counts toward stopping
+        misses = misses + 1 if round_gain < min_round_gain else 0
         if verbose:
             print(f"  [deep r{rnd}] residual={int(resid.sum()):,}  "
                   f"{len(round_hits)} rules from {len(blocks)} seeds  "
-                  f"(+{sum(h[4] for h in round_hits):,} frauds)")
+                  f"(+{round_gain:,} frauds)")
+        if misses >= max_misses:
+            break
     return deep_rules, info
