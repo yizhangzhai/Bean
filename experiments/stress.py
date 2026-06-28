@@ -255,9 +255,9 @@ def run(n=500_000, n_features=200, n_patterns=100, bad_rate=0.02, seed=0):
     t0 = time.perf_counter()
     empty = np.zeros(len(ytr), dtype=bool)
     deep, infos = recover_deep(Xtr_b, Xva_b, spec, ytr, yva, empty, max_rounds=30,
-                               top_k=22, seed_n=250, n_seeds=8, target_precision=0.6,
-                               min_accept_precision=0.12, max_misses=4,
-                               min_recall=0.004, min_support=20,
+                               top_k=22, seed_n=250, n_seeds=8, n_jobs=6,
+                               target_precision=0.6, min_accept_precision=0.12,
+                               max_misses=4, min_recall=0.004, min_support=20,
                                beam_width=64, max_depth=18, seed=seed, verbose=True)
     print(f"  [recover_deep(scratch) {time.perf_counter()-t0:.0f}s]  "
           f"{len(deep)} rules over {len(infos)} captured rounds")

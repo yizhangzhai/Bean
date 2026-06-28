@@ -79,6 +79,31 @@ def _kl_block(Xtr, seed_rows, hist_all, n_bins, top_k, eps=1e-9):
     return np.argsort(kl)[::-1][:top_k]
 
 
+def _search_block_worker(cols, sub_edges, pct, nb, schedule, min_recall,
+                         min_support, beam_width, max_depth, min_accept,
+                         Xtr, Xva, resid_col, yv_col):
+    """Relaxation search on ONE feature block -> (preds, val_prec, val_rec, used_tp)
+    for the best rule clearing min_accept, else None. Coverage is computed by the
+    caller. Top-level (picklable) so joblib can run the K seeds in parallel."""
+    sub_spec = BinSpec(sub_edges, pct, nb)
+    Xt, Xv = Xtr[:, cols], Xva[:, cols]
+    best = None
+    for tp in schedule:
+        rules, _ = targeted_beam_search(
+            Xt, resid_col, 0, sub_spec, min_recall=min_recall, target_precision=tp,
+            min_support=min_support, beam_width=beam_width, max_depth=max_depth,
+            Xbin_val=Xv, Y_val=yv_col, gap_tol=None, rank_by="f1")
+        for r in rules:
+            if r.val_precision < min_accept:
+                continue
+            preds = tuple((cols[f], op, k) for f, op, k in r.preds)
+            if best is None or r.val_recall > best[2]:
+                best = (preds, float(r.val_precision), float(r.val_recall), tp)
+        if best is not None:
+            return best
+    return best
+
+
 def _seed_clusters(model, Xsc, resid_idx, n_seeds, seed_n, min_support, seed):
     """Split the residual positives into up to n_seeds DISTINCT seeds for one
     detector fit -- by leaf co-membership (subspace-aware: a cluster ~ one
@@ -110,7 +135,7 @@ def recover_deep(Xtr, Xva, spec, ytr, yva, covered_tr, *, max_rounds=6,
                  top_k=16, seed_n=300, n_seeds=1, target_precision=0.7,
                  min_accept_precision=0.3, max_misses=8,
                  min_recall=0.01, min_support=40, beam_width=64, max_depth=18,
-                 subsample=80_000, seed=0, detector="lgbm",
+                 subsample=80_000, n_jobs=1, seed=0, detector="lgbm",
                  categorical=None, Xraw_tr=None, verbose=True):
     """Sequential-covering recovery of deep conjunctions on the residual.
 
@@ -148,35 +173,18 @@ def recover_deep(Xtr, Xva, spec, ytr, yva, covered_tr, *, max_rounds=6,
         tp *= 0.7
     yv_col = (yva == 1).astype(np.int64).reshape(-1, 1)
 
-    def find_rule(cols, resid):
-        """Relax precision target; return best (preds,r,mask,new,tp) with held-out
-        precision >= min_accept_precision, else None."""
-        sub_spec = BinSpec([spec.edges[c] for c in cols], spec.pct, nb)
-        Xt, Xv = Xtr[:, cols], Xva[:, cols]
-        resid_col = resid.astype(np.int64).reshape(-1, 1)
-        best = None
-        for tp in schedule:
-            rules, _ = targeted_beam_search(
-                Xt, resid_col, 0, sub_spec, min_recall=min_recall,
-                target_precision=tp, min_support=min_support,
-                beam_width=beam_width, max_depth=max_depth,
-                Xbin_val=Xv, Y_val=yv_col, gap_tol=None, rank_by="f1")
-            for r in rules:
-                if r.val_precision < min_accept_precision:
-                    continue
-                preds = tuple((cols[f], op, k) for f, op, k in r.preds)
-                m = rule_mask(preds, Xtr)             # full-data coverage
-                new = int((m & resid).sum())
-                if best is None or new > best[3]:
-                    best = (preds, r, m, new, tp)
-            if best is not None and best[3] >= min_support:
-                return best
-        return best if (best and best[3] >= min_support) else None
-
     # Each round refits the detector once, then derives up to `n_seeds` distinct
-    # seeds and searches them all against the FULL data -- capturing several
-    # patterns per detector fit (so ~n_seeds fewer rounds), with no fragmentation.
-    # The K searches per round are independent and can be parallelised.
+    # seeds and searches their blocks against the FULL data -- several patterns per
+    # detector fit (so ~n_seeds fewer rounds), with no fragmentation. With n_jobs>1
+    # the K per-round searches run in parallel processes (joblib memmaps the shared
+    # matrix); coverage/dedup happens in the parent.
+    par = bool(n_jobs and n_jobs > 1)
+    Xtr_s = np.ascontiguousarray(Xtr) if par else Xtr
+    Xva_s = np.ascontiguousarray(Xva) if par else Xva
+    wargs = (spec.pct, nb, schedule, min_recall, min_support, beam_width,
+             max_depth, min_accept_precision)
+    if par:
+        from joblib import Parallel, delayed
     misses = 0
     for rnd in range(max_rounds):
         resid = (ytr == 1) & ~covered
@@ -197,36 +205,56 @@ def recover_deep(Xtr, Xva, spec, ytr, yva, covered_tr, *, max_rounds=6,
         seeds = _seed_clusters(model, Xsc, resid_idx, n_seeds, seed_n,
                                min_support, seed + rnd)
 
+        blocks = [sorted(int(c) for c in _kl_block(Xtr, sr, hist_all, nb, top_k))
+                  for sr in seeds if sr.size >= min_support]
+        if not blocks:
+            misses += 1
+            if misses >= max_misses:
+                break
+            continue
+        resid_col = resid.astype(np.int64).reshape(-1, 1)
+        edges_per = [[spec.edges[c] for c in cols] for cols in blocks]
+        if par and len(blocks) > 1:
+            raw = Parallel(n_jobs=n_jobs)(
+                delayed(_search_block_worker)(cols, eg, *wargs, Xtr_s, Xva_s,
+                                              resid_col, yv_col)
+                for cols, eg in zip(blocks, edges_per))
+        else:
+            raw = [_search_block_worker(cols, eg, *wargs, Xtr_s, Xva_s,
+                                        resid_col, yv_col)
+                   for cols, eg in zip(blocks, edges_per)]
+
         round_hits, seen = [], set()
-        for seed_rows in seeds:
-            if seed_rows.size < min_support:
+        for res in raw:
+            if res is None:
                 continue
-            cols = sorted(int(c) for c in _kl_block(Xtr, seed_rows, hist_all, nb, top_k))
-            found = find_rule(cols, resid)
-            if found is None:
-                continue
-            key = frozenset(found[0])
+            preds, vp, vr, used_tp = res
+            key = frozenset(preds)
             if key in seen:
                 continue
+            m = rule_mask(preds, Xtr)
+            new = int((m & resid).sum())
+            if new < min_support:
+                continue
             seen.add(key)
-            round_hits.append(found)
+            round_hits.append((preds, vp, vr, m, new))
 
         if not round_hits:
             misses += 1
             if verbose:
                 print(f"  [deep r{rnd}] residual={int(resid.sum()):,}  "
-                      f"miss ({misses}/{max_misses}) over {len(seeds)} seeds")
+                      f"miss ({misses}/{max_misses}) over {len(blocks)} seeds")
             if misses >= max_misses:
                 break
             continue
         misses = 0
-        for preds, r, m, new, used_tp in round_hits:
+        for preds, vp, vr, m, new in round_hits:
             covered |= m
             deep_rules.append(preds)
             info.append(dict(round=rnd, depth=len(preds), new_covered=new,
-                             val_prec=r.val_precision, val_rec=r.val_recall))
+                             val_prec=vp, val_rec=vr))
         if verbose:
             print(f"  [deep r{rnd}] residual={int(resid.sum()):,}  "
-                  f"{len(round_hits)} rules from {len(seeds)} seeds  "
-                  f"(+{sum(h[3] for h in round_hits):,} frauds)")
+                  f"{len(round_hits)} rules from {len(blocks)} seeds  "
+                  f"(+{sum(h[4] for h in round_hits):,} frauds)")
     return deep_rules, info
