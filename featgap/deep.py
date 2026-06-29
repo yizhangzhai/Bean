@@ -60,23 +60,37 @@ def _fit_detector(Xfit, y, *, seed, detector, categorical):
     return m
 
 
-def _kl_block(Xtr, seed_rows, hist_all, n_bins, top_k, eps=1e-9):
-    """Block = features whose bin distribution among the seed rows diverges most
-    (KL) from their overall distribution -- i.e. the features the one dominant
-    pattern actually constrains. Returns original-index columns."""
+def _feature_block(Xtr, seed_rows, hist_all, cdf_all, n_bins, top_k, *,
+                   method="kl", cat_set=None, eps=1e-9):
+    """Top-k features the seed is most CONCENTRATED on vs the population.
+
+    method="kl"     KL divergence of the bin distribution (order-agnostic; default;
+                    handles categoricals correctly).
+    method="ks"     Kolmogorov-Smirnov max-CDF-gap (order-aware; ideal for numeric
+                    threshold/band conditions; the standard fraud separation metric).
+    method="hybrid" KS for numeric features, KL for nominal categoricals (`cat_set`)
+                    -- uses ordinal structure where it exists, falls back where it
+                    doesn't.
+    Returns original-index columns.
+    """
     F = Xtr.shape[1]
-    kl = np.empty(F)
+    cat_set = cat_set or set()
+    score = np.empty(F)
     for f in range(F):
         h = np.bincount(np.asarray(Xtr[seed_rows, f]), minlength=n_bins).astype(float)
         s = h.sum()
         if s == 0:
-            kl[f] = 0.0
+            score[f] = 0.0
             continue
         h /= s
-        ha = hist_all[f]
-        nz = h > 0
-        kl[f] = float(np.sum(h[nz] * np.log((h[nz] + eps) / (ha[nz] + eps))))
-    return np.argsort(kl)[::-1][:top_k]
+        use_ks = method == "ks" or (method == "hybrid" and f not in cat_set)
+        if use_ks:                                    # KS: max gap of the CDFs
+            score[f] = float(np.max(np.abs(np.cumsum(h) - cdf_all[f])))
+        else:                                         # KL divergence
+            ha = hist_all[f]
+            nz = h > 0
+            score[f] = float(np.sum(h[nz] * np.log((h[nz] + eps) / (ha[nz] + eps))))
+    return np.argsort(score)[::-1][:top_k]
 
 
 def _search_block_worker(cols, sub_edges, pct, nb, schedule, min_recall,
@@ -135,8 +149,9 @@ def recover_deep(Xtr, Xva, spec, ytr, yva, covered_tr, *, max_rounds=6,
                  top_k=16, seed_n=300, n_seeds=1, target_precision=0.7,
                  min_accept_precision=0.3, max_misses=8,
                  min_recall=0.01, min_support=40, beam_width=64, max_depth=18,
-                 subsample=80_000, n_jobs=1, min_round_gain=0, seed=0,
-                 detector="lgbm", categorical=None, Xraw_tr=None, verbose=True):
+                 subsample=80_000, n_jobs=1, min_round_gain=0, block_score="kl",
+                 seed=0, detector="lgbm", categorical=None, Xraw_tr=None,
+                 verbose=True):
     """Sequential-covering recovery of deep conjunctions on the residual.
 
     Each round: fit the detector on the still-uncovered frauds, ISOLATE the single
@@ -150,6 +165,10 @@ def recover_deep(Xtr, Xva, spec, ytr, yva, covered_tr, *, max_rounds=6,
     consecutive misses does covering stop. This keeps hunting real patterns in a
     residual swamped by an unmineable rare tail.
 
+    block_score: how to score a seed's feature concentration when picking the
+      block -- "kl" (default), "ks" (Kolmogorov-Smirnov max-CDF-gap; order-aware,
+      the standard fraud separation metric, ideal for numeric thresholds/bands), or
+      "hybrid" (KS for numeric, KL for the nominal `categorical` columns).
     detector: "lgbm" (default, scalable + native missing/categorical) or "rf".
     Xraw_tr: optional raw (unbinned) matrix for the DETECTOR only (lets LightGBM
       exploit real NaN / categorical); the refine always runs on binned `Xtr`.
@@ -163,10 +182,13 @@ def recover_deep(Xtr, Xva, spec, ytr, yva, covered_tr, *, max_rounds=6,
     src = Xraw_tr if Xraw_tr is not None else Xtr
     nb = spec.n_bins
     F = Xtr.shape[1]
-    hist_all = []                                  # overall bin dist (KL baseline)
+    hist_all, cdf_all = [], []                     # overall bin dist + CDF (KL/KS)
     for f in range(F):
         h = np.bincount(np.asarray(Xtr[:, f]), minlength=nb).astype(float)
-        hist_all.append(h / max(1.0, h.sum()))
+        h = h / max(1.0, h.sum())
+        hist_all.append(h)
+        cdf_all.append(np.cumsum(h))
+    cat_set = set(int(c) for c in categorical) if categorical else set()
     schedule, tp = [], target_precision
     while tp >= min_accept_precision - 1e-9:
         schedule.append(round(tp, 3))
@@ -205,7 +227,9 @@ def recover_deep(Xtr, Xva, spec, ytr, yva, covered_tr, *, max_rounds=6,
         seeds = _seed_clusters(model, Xsc, resid_idx, n_seeds, seed_n,
                                min_support, seed + rnd)
 
-        blocks = [sorted(int(c) for c in _kl_block(Xtr, sr, hist_all, nb, top_k))
+        blocks = [sorted(int(c) for c in _feature_block(
+                      Xtr, sr, hist_all, cdf_all, nb, top_k,
+                      method=block_score, cat_set=cat_set))
                   for sr in seeds if sr.size >= min_support]
         if not blocks:
             misses += 1

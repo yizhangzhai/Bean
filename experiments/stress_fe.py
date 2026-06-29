@@ -39,13 +39,15 @@ def make_mixed(n, n_features, seed, n_axis=28):
     r = np.hypot(X[:, 0] - 20, X[:, 1] - 20)
     ratio = X[:, 2] / X[:, 3]
     tmod = np.mod(X[:, 4], 24)
-    patterns, region = [], []
-    patterns.append(dict(kind="ring")); region.append((r > 4) & (r < 6))
-    patterns.append(dict(kind="ratio")); region.append(ratio > np.quantile(ratio, .96))
-    patterns.append(dict(kind="periodic")); region.append((tmod >= 2) & (tmod <= 4))
+    fire = 0.85
+    patterns, region = [], []                       # non-axis ~2% of rows each
+    patterns.append(dict(kind="ring")); region.append((r > 4.5) & (r < 5.5))
+    patterns.append(dict(kind="ratio")); region.append(ratio > np.quantile(ratio, .98))
+    patterns.append(dict(kind="periodic")); region.append((tmod >= 2) & (tmod <= 2.5))
 
     pool = list(range(5, n_features - n_cat)) + cat_idx
-    sizes = rng.integers(200, 1500, n_axis)
+    sizes = rng.integers(200, 1500, n_axis).astype(float)
+    sizes = np.maximum(60, sizes / sizes.sum() * 0.03 * n / fire).astype(int)  # ~3% total
     for p in range(n_axis):
         d, Np = int(rng.choice([2, 3, 4, 5, 6])), int(sizes[p])
         q = (Np / n) ** (1.0 / d)
