@@ -31,11 +31,12 @@ MISSING = N_BINS                       # reserved bin code for NaN (real bins 0.
 # --------------------------------------------------------------------------- #
 # encoding: numeric -> quantile bins; categorical -> positive-rate rank; NaN -> MISSING
 # --------------------------------------------------------------------------- #
-def _encode(Xtr, Xva, ytr, cat_set, sample, seed):
+def _encode(Xtr, Xva, ytr, cat_set, sample, seed, n_bins=N_BINS):
     F = Xtr.shape[1]
+    missing = n_bins                   # NaN bin code (real bins 0..n_bins-1)
     btr = np.empty((F, Xtr.shape[0]), dtype=np.int8)
     bva = np.empty((F, Xva.shape[0]), dtype=np.int8)
-    qs = np.arange(1, N_BINS) / N_BINS
+    qs = np.arange(1, n_bins) / n_bins
     edges = [None] * F
     render = [None] * F                # per feature: ("num",) or ("cat", code->rank)
     rng = np.random.default_rng(seed)
@@ -45,28 +46,29 @@ def _encode(Xtr, Xva, ytr, cat_set, sample, seed):
             vm = ~np.isnan(ct)
             codes = ct[vm].astype(np.int64)
             rk = target_rank(codes, ytr[vm])               # Fisher-trick rank
-            edges[f] = np.arange(1, N_BINS) - 0.5
+            edges[f] = np.arange(1, n_bins) - 0.5
             render[f] = ("cat", rk)
             tr_c = np.where(np.isnan(ct), 0, ct).astype(np.int64)
             va_c = np.where(np.isnan(cv), 0, cv).astype(np.int64)
             va_c = np.clip(va_c, 0, len(rk) - 1)           # unseen val codes -> 0
-            btr[f] = np.where(np.isnan(ct), MISSING, rk[tr_c]).astype(np.int8)
-            bva[f] = np.where(np.isnan(cv), MISSING, rk[va_c]).astype(np.int8)
+            btr[f] = np.where(np.isnan(ct), missing, rk[tr_c]).astype(np.int8)
+            bva[f] = np.where(np.isnan(cv), missing, rk[va_c]).astype(np.int8)
         else:
             v = ct[~np.isnan(ct)]
             if v.size > sample:
                 v = v[rng.integers(0, v.size, sample)]
             e = np.quantile(v, qs).astype(np.float64) if v.size else qs
             edges[f], render[f] = e, ("num",)
-            bt = np.searchsorted(e, ct, side="right"); bt[np.isnan(ct)] = MISSING
-            bv = np.searchsorted(e, cv, side="right"); bv[np.isnan(cv)] = MISSING
+            bt = np.searchsorted(e, ct, side="right"); bt[np.isnan(ct)] = missing
+            bv = np.searchsorted(e, cv, side="right"); bv[np.isnan(cv)] = missing
             btr[f], bva[f] = bt.astype(np.int8), bv.astype(np.int8)
-    return btr.T, bva.T, BinSpec(edges, qs, N_BINS + 1), render
+    return btr.T, bva.T, BinSpec(edges, qs, n_bins + 1), render
 
 
 def _render_pred(f, op, k, render, names, spec=None):
+    nb = (spec.n_bins - 1) if spec is not None else N_BINS   # real bins (excl MISSING)
     if render[f][0] == "num":
-        pct = int(round((k + 1) / N_BINS * 100))
+        pct = int(round((k + 1) / nb * 100))
         return f"{names[f]} {op} p{pct:02d}"
     if render[f][0] == "cmp":                          # comparison: real threshold
         edges = spec.edges[f]
@@ -75,7 +77,7 @@ def _render_pred(f, op, k, render, names, spec=None):
         return f"{render[f][1]} {op} {tval}"           # e.g.  "A - B > 0"  /  "(C-D)*A/B > 0.42"
     rk = render[f][1]                                  # code -> rank
     keep = [c for c, r in enumerate(rk) if (r > k if op == ">" else r <= k)]
-    if op == ">" and k == MISSING - 1:                # isolates the missing bin
+    if op == ">" and k == nb - 1:                     # isolates the missing bin
         return f"{names[f]} is MISSING"
     return f"{names[f]} in {{{','.join(map(str, sorted(keep)))}}}"
 
@@ -113,6 +115,24 @@ def _residual_cols(Xtr_raw, resid, cat_set, n_cand):
     return [f for _, f in score[:n_cand]]
 
 
+def _fit_weights(M, lbl):
+    """Learn raw-unit weights w for the linear combo M @ w that best separates lbl
+    (logistic regression on standardized columns; mean-difference fallback). The
+    margin's offset is irrelevant -- the threshold search absorbs it -- so only the
+    direction matters; weights are returned unit-normalized in raw units."""
+    sd = M.std(0) + 1e-9
+    Z = (M - M.mean(0)) / sd
+    try:
+        from sklearn.linear_model import LogisticRegression
+        w = LogisticRegression(max_iter=200, class_weight="balanced").fit(
+            Z, lbl.astype(int)).coef_[0]
+    except Exception:
+        m = lbl > 0
+        w = Z[m].mean(0) - Z[~m].mean(0)
+    w = w / (np.linalg.norm(w) + 1e-9)
+    return w / sd                                      # back to raw units
+
+
 def _bin_edges(v, qs, rng, *, snap_zero=False):
     """Quantile edges for a margin column; optionally snap the nearest edge to 0
     so a comparison (margin > 0) is an EXACT cut, when 0 lies inside the range."""
@@ -141,7 +161,8 @@ def _engineer(Xtr_b, Xva_b, spec, render, names, Xtr_raw, Xva_raw, ytr,
         covered_tr |= rule_mask(preds, Xtr_b)
     resid = (ytr == 1) & ~covered_tr
 
-    qs = np.arange(1, N_BINS) / N_BINS
+    nb = spec.n_bins - 1                               # real bins (match base encoding)
+    qs = np.arange(1, nb) / nb
     rng = np.random.default_rng(seed + 11)
     Xt_all = np.nan_to_num(np.asarray(Xtr_raw, dtype=np.float64))   # full matrix for compare
     Xv_all = np.nan_to_num(np.asarray(Xva_raw, dtype=np.float64))
@@ -174,6 +195,20 @@ def _engineer(Xtr_b, Xva_b, spec, render, names, Xtr_raw, Xva_raw, ytr,
         new_tr.append(assign_bins(vt, e)[:, None]); new_va.append(assign_bins(vv, e)[:, None])
         new_edges.append(e); new_render.append(("cmp", label)); added.append(label)
 
+    # 3) LEARNED weighted combinations: fit w over the given columns on the residual,
+    #    margin = sum(w_i * x_i), thresholded -> a fully learnable weighted comparison
+    for entry in opts.get("learn", []):
+        lbl, lcols = (entry if isinstance(entry, (tuple, list)) and len(entry) == 2
+                      else (None, entry))
+        lcols = list(lcols)
+        w = _fit_weights(Xt_all[:, lcols], resid)
+        vt = Xt_all[:, lcols] @ w
+        vv = Xv_all[:, lcols] @ w
+        e = _bin_edges(vt, qs, rng, snap_zero=True)
+        flabel = lbl or " ".join(f"{wi:+.3g}*{names[c]}" for wi, c in zip(w, lcols))
+        new_tr.append(assign_bins(vt, e)[:, None]); new_va.append(assign_bins(vv, e)[:, None])
+        new_edges.append(e); new_render.append(("cmp", flabel)); added.append(flabel)
+
     if not new_tr:
         return Xtr_b, Xva_b, spec, render, names, [], covered_tr
     Xtr_aug = np.concatenate([np.asarray(Xtr_b)] + new_tr, axis=1)
@@ -188,7 +223,7 @@ def _engineer(Xtr_b, Xva_b, spec, render, names, Xtr_raw, Xva_raw, ytr,
 # the pipeline
 # --------------------------------------------------------------------------- #
 def mine_rules(X, y, *, categorical=None, names=None, val_frac=0.33, seed=0,
-               n_jobs=1, sample=100_000, serial=False, engineer=None,
+               n_jobs=1, sample=100_000, n_bins=N_BINS, serial=False, engineer=None,
                val_gap_tol=None, verbose=False, **deep_kwargs):
     """Mine interpretable rules. X: (n, F) float (NaN allowed). y: (n,) 0/1.
     `categorical`: column indices to treat as categorical. Returns (rules, eval)
@@ -209,6 +244,13 @@ def mine_rules(X, y, *, categorical=None, names=None, val_frac=0.33, seed=0,
                                by more than this (e.g. 0.1). None = validate only at
                                acceptance (default).
 
+    Binning:
+      n_bins   -- number of equal-frequency quantile bins per numeric feature
+                  (default 16; quantile width = 1/n_bins). Raise it (e.g. 32, 64)
+                  for finer thresholds / cut points -- more precise rules and
+                  comparison thresholds, at more compute and thinner per-bin support.
+                  Must be < 127 (int8 bin codes; MISSING = n_bins).
+
     Mode flags:
       serial   -- force the fully-serial peel-one-pattern-at-a-time miner
                   (n_seeds=1, n_jobs=1): most accurate, slowest. Overrides n_jobs.
@@ -226,7 +268,14 @@ def mine_rules(X, y, *, categorical=None, names=None, val_frac=0.33, seed=0,
                                 (C-D)<(A-B), (C-D)*A/B>w, etc. Binned with 0 as an
                                 exact cut; rules render with the real threshold
                                 (e.g. "A - B > 0", "(C-D)*A/B > 0.42" -- the w is the
-                                discovered cut).
+                                discovered cut). Fixed weights only (whatever you
+                                write in fn); for LEARNED weights use `learn`.
+                    learn       [(label, [cols]) ...] LEARNED weighted combinations:
+                                fit w over the columns on the residual (logistic
+                                regression), margin = sum(w_i * x_i), thresholded --
+                                a fully learnable weighted comparison over any number
+                                of columns. label=None auto-names it with the fitted
+                                weights ("+0.8*f0 -0.6*f1 ...").
                     max_features, n_cand
                   Engineered + comparison features are appended and the residual
                   re-mined; synthesized rules render `name op pXX`, comparison rules
@@ -242,7 +291,8 @@ def mine_rules(X, y, *, categorical=None, names=None, val_frac=0.33, seed=0,
     tr, va = perm[:cut], perm[cut:]
     ytr, yva = y[tr], y[va]
 
-    Xtr_b, Xva_b, spec, render = _encode(X[tr], X[va], ytr, cat_set, sample, seed + 7)
+    Xtr_b, Xva_b, spec, render = _encode(X[tr], X[va], ytr, cat_set, sample,
+                                         seed + 7, n_bins)
 
     npos = int((ytr == 1).sum())
     defaults = dict(max_rounds=30, top_k=22, seed_n=250, n_seeds=8,

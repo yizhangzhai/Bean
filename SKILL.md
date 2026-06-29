@@ -216,6 +216,21 @@ Rule of thumb: write the relation as `LHS − RHS` in the lambda. Fix a weight i
 `fn` for a hard `A > 1.5·B`; leave it free (`A/B`, `A−B`) and the threshold search
 discovers the best `w`. Works for any number of columns and any algebra.
 
+**Learnable weights.** `compare` weights are fixed. To *learn* them: `learn=[(label,
+cols)]` fits `margin = Σ wᵢ·xᵢ` over the columns by logistic regression on the
+residual, threshold learned — a fully learnable weighted comparison; or
+`formats=("linear",)` for automatic per-pair `w1·A + w2·B`.
+```python
+rules, ev = mine_rules(X, y, n_bins=32, engineer=dict(formats=(), learn=[(None, [0,1])]))
+# recovers e.g. a planted 0.8·f0 − 0.6·f1 > 1.0 as  "+0.787*f0 -0.619*f1 > 1.015"
+```
+A weight inside a nonlinear term (the `w` in a product/ratio) is not auto-fit — fix
+it, or rewrite so it is the threshold (`A > w·B` ⇔ `A/B > w`).
+
+**Finer thresholds.** `n_bins` (default 16) sets the quantile grid; the cut
+resolution is one bin (~`100/n_bins` percentile). Raise it (`n_bins=32`/`64`) for
+sharper cut points and comparison thresholds, at thinner per-bin support.
+
 ### S7b — "Validation-checked growth / most-accurate (serial) mode"
 Two reliability knobs:
 - `val_gap_tol=0.1` — validate **during** conjunction: any path whose train
@@ -328,6 +343,8 @@ python -m pytest tests/ -q
 | business / rule constraints | `mine_rules(policy=RulePolicy.build(...))` — enforced during search (S6) |
 | ratio/sum/weighted/ring/periodic | `mine_rules(engineer=dict(formats=...))` (S7) |
 | compare features (A>B, A>w·B, …) | `mine_rules(engineer=dict(compare=[(label, fn)]))` (S7c) |
+| learn comparison weights | `mine_rules(engineer=dict(learn=[(label, cols)]))` (S7c) |
+| finer / coarser thresholds | `mine_rules(n_bins=32)` (default 16) |
 | stop overfit growth | `mine_rules(val_gap_tol=0.1)` — validate during conjunction (S7b) |
 | most accurate (slow) | `mine_rules(serial=True)` (S7b) |
 | faster | `n_jobs = cores` |

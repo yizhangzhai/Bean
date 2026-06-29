@@ -77,6 +77,7 @@ Numeric thresholds render as percentiles (`> p95`), categoricals as value sets
 | `n_jobs` | 1 | worker processes for the per-round seed searches |
 | `block_score` | `"hybrid"` | feature-block scorer: `kl` / `ks` / `hybrid` (KS numeric + KL categorical) |
 | `max_misses` | 2 | consecutive low-yield rounds before stopping |
+| `n_bins` | 16 | equal-frequency quantile bins per numeric feature (quantile width = 1/`n_bins`); raise for finer thresholds, lower for coarser. Must be < 127 |
 | `policy` | `None` | `RulePolicy` enforced during search: feature usage, 1-/2-way splits, forbidden / mutually-exclusive pairs, allowed directions & ranges, required-with |
 | `val_gap_tol` | `None` | real-time held-out brake: stop growing a conjunction once train precision exceeds its validation precision by more than this (e.g. `0.1`) |
 | `serial` | `False` | force the fully-serial peel-one-pattern-at-a-time miner (`n_seeds=1, n_jobs=1`): most accurate, slowest |
@@ -146,6 +147,25 @@ exactly, and the rule renders with the **real threshold**, e.g. `f0 - f1 > 0`
 (= `A > B`) or `(f2-f3)*f0/f1 > 0.42` — for a `> w` relation the printed value *is*
 the discovered `w`. Any expression of any number of columns works; fix the weight
 inside `fn` (`A − 1.5·B`) or leave it free and let the threshold search find it.
+
+**Learnable weights.** The `compare` weights above are *fixed* (whatever you write
+in `fn`). To **learn** the weights, two routes:
+
+- `formats=("linear",)` fits `w1·A + w2·B` per feature pair by logistic regression
+  on the residual (pairwise, automatic).
+- `learn=[(label, cols)]` fits a weighted combination over *any* set of columns —
+  `margin = Σ wᵢ·xᵢ`, weights fit on the residual, threshold learned — a fully
+  learnable weighted comparison:
+
+```python
+rules, ev = mine_rules(X, y, n_bins=32, engineer=dict(
+    formats=(), learn=[(None, [0, 1])]))      # label=None auto-names with the weights
+# e.g. recovers a planted 0.8·f0 − 0.6·f1 > 1.0 as  "+0.787*f0 -0.619*f1 > 1.015"
+```
+
+Weights *inside* a nonlinear term (the `w` in a product/ratio) are not auto-fit —
+fix them in `fn`, or express the relation so the weight becomes the threshold
+(`A > w·B` ⇔ `A/B > w`, and the cut is the learned `w`).
 
 ---
 
