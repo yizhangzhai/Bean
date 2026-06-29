@@ -261,6 +261,10 @@ def mixed_targeted_search(M, y, meta, *, min_recall=0.25, target_precision=0.5,
         for r in beam:
             idx = np.flatnonzero(r.mask)
             sub_y = y[idx]
+            # smooth categorical Fisher-rates toward the LOCAL (subset) base rate,
+            # not the global one -- inside a conjunction the fraud rate is much
+            # higher, and the global prior would mis-order small-support categories
+            sub_base = float(sub_y.mean()) if len(sub_y) else base
             used = r.fkeys()
             rfeats = {fk[0] for fk in used}
             for f in range(F):
@@ -269,7 +273,7 @@ def mixed_targeted_search(M, y, meta, *, min_recall=0.25, target_precision=0.5,
                 if policy is not None and not policy.extend_ok(rfeats, f, None):
                     continue                       # forbidden pair / mutual-excl
                 col = M[idx, f]
-                for pred, s, tp in feature_cands(f, col, sub_y, meta, min_support, base, policy):
+                for pred, s, tp in feature_cands(f, col, sub_y, meta, min_support, sub_base, policy):
                     if pred.fkey() in used:
                         continue
                     explored += 1

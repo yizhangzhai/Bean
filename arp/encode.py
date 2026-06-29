@@ -65,7 +65,9 @@ def target_rank(codes: np.ndarray, y: np.ndarray, n_codes: int | None = None,
     (array indexed by category code).
     """
     codes = codes.astype(np.int64)
-    K = n_codes or int(codes.max()) + 1
+    if codes.min() < 0:
+        raise ValueError("target_rank: category codes must be non-negative")
+    K = max(int(n_codes or 0), int(codes.max()) + 1)   # robust to n_codes < max+1
     cnt = np.bincount(codes, minlength=K).astype(float)
     pos = np.bincount(codes, weights=y.astype(float), minlength=K)
     base = float(y.mean())

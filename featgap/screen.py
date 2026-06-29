@@ -77,6 +77,8 @@ def hsic(x, y, *, sample=1500, seed=0):
         return np.exp(-d2 / (med if med > 0 else 1.0))
 
     m = len(idx)
+    if m < 2:
+        return 0.0
     H = np.eye(m) - np.ones((m, m)) / m
     Kx, Ky = K(X), K(Y)
     return float(np.trace(Kx @ H @ Ky @ H) / (m - 1) ** 2)

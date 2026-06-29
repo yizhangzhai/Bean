@@ -107,14 +107,17 @@ def propose_features(X, gap_mask, names, *, ring_thresh=0.5, max_features=5,
                         name=f"dist({names[i]},{names[j]}; c=({center[0]:.1f},{center[1]:.1f}))",
                         transform=tf, kind="radial", lift=b[0], band=b, topo=sc))
 
-    # 2) generic algebraic transforms
+    # 2) generic algebraic transforms. Ratio is asymmetric (i/j != j/i) so both
+    # orders; diff is symmetric under a two-sided band (a-b vs b-a give the same
+    # band), so only i<j to avoid duplicate candidates.
     for i in range(F):
         for j in range(F):
             if i == j:
                 continue
-            for kind, tf in (
-                    ("ratio", lambda A, i=i, j=j: A[:, i] / (np.abs(A[:, j]) + eps)),
-                    ("diff", lambda A, i=i, j=j: A[:, i] - A[:, j])):
+            pairs = [("ratio", lambda A, i=i, j=j: A[:, i] / (np.abs(A[:, j]) + eps))]
+            if i < j:
+                pairs.append(("diff", lambda A, i=i, j=j: A[:, i] - A[:, j]))
+            for kind, tf in pairs:
                 b = best_band(tf(X), lbl)
                 if b:
                     cands.append(dict(

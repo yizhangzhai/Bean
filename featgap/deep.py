@@ -213,9 +213,13 @@ def recover_deep(Xtr, Xva, spec, ytr, yva, covered_tr, *, max_rounds=6,
         resid_idx = np.flatnonzero(resid)
         if resid_idx.size < min_support:
             break
-        keep_idx = np.flatnonzero(~((ytr == 1) & covered))
+        # fit the detector on ALL residual positives + a sample of the rest, so it
+        # never gets a single-class subsample and always sees the full signal
         rng = np.random.default_rng(seed + rnd)
-        sub = rng.choice(keep_idx, min(subsample, len(keep_idx)), replace=False)
+        neg = np.flatnonzero(~((ytr == 1)))           # non-fraud pool (covered or not)
+        n_neg = min(len(neg), max(subsample - resid_idx.size, subsample // 2))
+        sub = (np.concatenate([resid_idx, rng.choice(neg, n_neg, replace=False)])
+               if len(neg) else resid_idx)
         Xfit = np.asarray(src[sub])
         if Xraw_tr is None:
             Xfit = Xfit.astype(np.float32)

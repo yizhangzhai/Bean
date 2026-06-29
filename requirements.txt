@@ -1,2 +1,5 @@
 numpy>=1.24
-scikit-learn>=1.1   # baseline tree only
+scikit-learn>=1.1     # detector fallback (RandomForest), reference tree baseline
+lightgbm>=4.0         # default residual detector in featgap.recover_deep
+joblib>=1.3           # parallel per-round seed searches (n_jobs)
+# optional: pandas    # only for pipeline.py --data CSV loading

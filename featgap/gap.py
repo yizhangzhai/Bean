@@ -41,6 +41,10 @@ def remine_residual(Xbin, y, covered, spec, *, target_precision=0.5,
     recall over all residual rules (how much of the gap axis rules can recover).
     """
     gap = (y == 1) & ~covered
+    if int(gap.sum()) < max(2 * min_support, 10):    # too small to diagnose
+        return dict(gap=int(gap.sum()), fillable_by_axis=False, union_recall=0.0,
+                    verdict="residual too small to diagnose", best=None,
+                    precision=0.0, recall=0.0, rules=[])
     keep = ~((y == 1) & covered)                 # drop covered frauds
     Xk = Xbin[keep]
     yk = gap[keep].astype(np.int64).reshape(-1, 1)
