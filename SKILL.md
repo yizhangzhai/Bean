@@ -227,9 +227,9 @@ python pipeline.py --synthetic --n 200000 --features 120 --patterns 40 --jobs 6
 
 ## 6. Lower-level building blocks (when `mine_rules` isn't enough)
 
-- `arp.encode` — `quantile_edges`, `assign_bins`, `target_rank`, `fit_bins`,
-  `BinSpec`. Use `pipeline._encode(Xtr, Xva, ytr, cat_set, sample, seed)` to get
-  `(Xtr_bins, Xva_bins, spec, render)` ready for any miner.
+- `arp.encode` — `quantile_edges`, `assign_bins`, `target_rank`; `arp.fast` —
+  `BinSpec`, `fit_bins`, `rule_mask`. Easiest: `pipeline._encode(Xtr, Xva, ytr,
+  cat_set, sample, seed)` → `(Xtr_bins, Xva_bins, spec, render)` ready for any miner.
 - `arp.targeted.targeted_beam_search(Xbin, Y, target, spec, *, policy=…, rank_by=…)`
   — single-pass precision/recall-targeted beam (no detector seeding); the place to
   enforce a `RulePolicy`.
