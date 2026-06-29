@@ -27,12 +27,6 @@ features.
 pip install -r requirements.txt      # numpy, scikit-learn, lightgbm, joblib
 ```
 
-> **Can't clone?** [`portable/`](portable/) is a self-contained copy/paste copy of
-> the runtime (the `mine_rules` pipeline + deep miner + feature engineering, minus
-> the reference miner). It includes `portable/bean_bundle.py`, a single
-> self-extracting file you can paste onto any machine and run
-> (`python3 bean_bundle.py`). See [`portable/PASTE_GUIDE.md`](portable/PASTE_GUIDE.md).
-
 ## Quick start
 
 **CLI** — on generated data, or your own CSV:
@@ -219,21 +213,25 @@ fully-serial behavior.
 
 ```
 arp/            core miner
+  __init__.py     re-exports the runtime API
   encode.py       float -> int8 bins (sampled edges, column-major, threaded); target_rank
   fast.py         BinSpec, fit_bins, fast_beam_search, rule_mask (histogram beam)
+  scoring.py      Score + base rates (used by fast)
   targeted.py     targeted_beam_search (precision/recall-targeted; rank_by f1/precision)
   mixed.py        categorical-native miner (Eq/In predicates, Fisher-trick splits)
   constraints.py  RulePolicy (allowed features, monotone dirs, forbidden pairs, ...)
-  ...             search/scoring/encoding/portfolio  (reference miner used by tests)
+  progress.py     progress reporting
 featgap/        gap-driven layer on top of arp (one-directional dependency)
+  __init__.py     re-exports recover_deep / propose_features / diagnostics
   deep.py         recover_deep  -- the sequential-covering seed-parallel engine
   gap.py          residual + axis/non-axis diagnostic
   screen.py       interaction-information / HSIC dependence screens
-  synthesize.py   ring/ratio/diff/periodic feature synthesis
+  synthesize.py   ring/ratio/diff/sum/linear/periodic feature synthesis
 synth.py        one configurable synthetic data generator (make_data)
 pipeline.py     end-to-end entry point: mine_rules(X, y, ...) + CLI
 benchmark.py    one runner: capture | scale | deep | featgap | categorical
-tests/          test_basic.py
+conftest.py     makes the folder importable under pytest
+tests/          test_basic.py  (tests the mine_rules pipeline)
 ```
 
 ## Benchmarks
