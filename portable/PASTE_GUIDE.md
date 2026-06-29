@@ -65,6 +65,19 @@ python pipeline.py --synthetic --n 50000 --features 60 --patterns 15 --jobs 4
 probably running from the wrong directory — run from inside `bean/` (the folder
 that contains `pipeline.py`), or add it to `PYTHONPATH`.
 
+## Rebuilding the bundle
+
+`bean_bundle.py` is generated from this folder. After editing any file here,
+regenerate it with:
+
+```bash
+python3 rebuild_bundle.py        # rewrites bean_bundle.py from the current files
+```
+
+The build is deterministic (file metadata zeroed), so an unchanged tree always
+produces an identical bundle. `bean_bundle.py`, `rebuild_bundle.py`, and this guide
+are not embedded inside the archive (they are wrappers/tooling, not runtime code).
+
 ## Notes
 
 - This is the **portable runtime subset**: the `mine_rules` pipeline plus the deep
