@@ -77,6 +77,12 @@ Numeric thresholds render as percentiles (`> p95`), categoricals as value sets
 | `n_jobs` | 1 | worker processes for the per-round seed searches |
 | `block_score` | `"hybrid"` | feature-block scorer: `kl` / `ks` / `hybrid` (KS numeric + KL categorical) |
 | `max_misses` | 2 | consecutive low-yield rounds before stopping |
+| `policy` | `None` | `RulePolicy` enforced during search: feature usage, 1-/2-way splits, forbidden / mutually-exclusive pairs, allowed directions & ranges, required-with |
+
+**Rule-level constraints** are first-class: precision/recall floors are the
+`min_accept_precision` / `min_recall` kwargs, and structural constraints go through
+`policy=RulePolicy.build(monotone_up=…, disable=…, forbidden_pairs=…, ranges=…, …)`
+— see `SKILL.md` §S6.
 
 ---
 

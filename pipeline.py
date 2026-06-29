@@ -93,7 +93,18 @@ def mine_rules(X, y, *, categorical=None, names=None, val_frac=0.33, seed=0,
                n_jobs=1, sample=100_000, verbose=False, **deep_kwargs):
     """Mine interpretable rules. X: (n, F) float (NaN allowed). y: (n,) 0/1.
     `categorical`: column indices to treat as categorical. Returns (rules, eval)
-    where eval = dict(recall, precision, flagged, positives)."""
+    where eval = dict(recall, precision, flagged, positives, n_rules, val_idx, val_cov).
+
+    Rule-level controls (pass as kwargs, forwarded to recover_deep):
+      min_accept_precision  -- min held-out precision a rule must clear (default 0.12)
+      min_recall            -- recall floor (default 0.004)
+      min_support           -- min rows a rule must match (default 20)
+      max_depth             -- max conditions per rule (default 18)
+      target_precision      -- precision the search aims for (default 0.6)
+      policy                -- arp.constraints.RulePolicy: feature usage, 1-/2-way
+                               splits, forbidden / mutually-exclusive pairs, allowed
+                               directions & threshold ranges, required-with (enforced
+                               DURING the search)."""
     X = np.asarray(X, dtype=np.float32)
     y = np.asarray(y).astype(np.int64)
     n, F = X.shape

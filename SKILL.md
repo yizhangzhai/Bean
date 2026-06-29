@@ -130,43 +130,38 @@ rules, ev = mine_rules(X, y, categorical=cat_idx, n_jobs=6,
 If still shallow, the deep patterns may be **below the rarity floor** (§7) — verify
 with the diagnostic in S10 before promising more.
 
-### S6 — "Apply business constraints (monotonic, forbidden pairs, allowed-only)"
-`mine_rules`/`recover_deep` do **not** take a policy. Two correct options:
-
-**(a) Post-filter** the rules from `mine_rules` (simplest; keeps deep mining).
-Use the policy's own predicates — `pred_ok` (disabled feature / direction / range),
-`extend_ok` (forbidden & mutually-exclusive pairs), `rule_ok` (required-with):
+### S6 — "Apply rule-level / business constraints"
+Build a `RulePolicy` and pass it to `mine_rules(policy=…)` — it is enforced
+**during** the deep search (only compliant rules are accepted), and **min
+precision / min recall are separate kwargs**:
 ```python
 from arp.constraints import RulePolicy
-policy = RulePolicy.build(monotone_up=[chargeback_idx], forbidden_pairs=[(a, b)],
-                          disable=[leaky_idx])
-NB = 17                                       # the encoder's bin count (16 + missing bin)
-def compliant(r):
-    fs = {f for f, _, _ in r.preds}
-    if not all(policy.pred_ok(f, op, k, NB) for f, op, k in r.preds):       # per-feature
-        return False
-    if not all(policy.extend_ok(fs - {f}, f, op) for f, op, _ in r.preds):  # pairwise
-        return False
-    return policy.rule_ok(fs)                                               # required-with
-rules = [r for r in rules if compliant(r)]
-```
+from pipeline import mine_rules
 
-**(b) Constrained single-pass mining** (enforced *during* search, but no deep
-detector seeding — shallower):
-```python
-import numpy as np
-from pipeline import _encode
-from arp.targeted import targeted_beam_search
-n = len(y); perm = np.random.default_rng(0).permutation(n); cut = int(n*0.67)
-tr, va = perm[:cut], perm[cut:]
-Xtr_b, Xva_b, spec, render = _encode(X[tr], X[va], y[tr], set(cat_idx), 100_000, 7)
-rules_t, _ = targeted_beam_search(Xtr_b, y[tr][:,None], 0, spec,
-                                  Xbin_val=Xva_b, Y_val=y[va][:,None],
-                                  target_precision=0.6, min_support=30, policy=policy)
+policy = RulePolicy.build(
+    monotone_up=[chargeback_idx],     # this feature may only split with ">" (1-way up)
+    one_way=[score_idx],              # single cut only (no two-sided band)
+    disable=[leaky_idx],              # never use this feature
+    forbidden_pairs=[(a, b)],         # a and b may not co-occur in a rule
+    mutually_exclusive=[(c, d)],      # at most one of c, d
+    required_with={e: [f]},           # if e is used, f must be too
+    ranges={amt_idx: (0.5, 1.0)},     # only split amt in the top-half percentile range
+)
+rules, ev = mine_rules(
+    X, y, categorical=cat_idx, names=feat, n_jobs=6, policy=policy,
+    min_accept_precision=0.30,        # min held-out precision per rule
+    min_recall=0.01,                  # min recall per rule
+    min_support=50, max_depth=12,     # support / max conditions
+)
 ```
 `RulePolicy.build` accepts: `monotone_up/down`, `one_way`, `ranges`, `disable`,
 `forbidden_pairs`, `discouraged_pairs`, `mutually_exclusive`, `required_with`,
-`cat_eq_only`, `cat_set_only`, `max_set_size`, `allowed_levels`.
+`cat_eq_only`, `cat_set_only`, `max_set_size`, `allowed_levels`. Every emitted
+rule is guaranteed to satisfy the policy.
+
+For a fully constrained **single-pass** miner (categorical-native, no detector
+seeding) you can also call `arp.targeted.targeted_beam_search(..., policy=policy)`
+or `arp.mixed.mixed_targeted_search(..., policy=policy)` on encoded bins directly.
 
 ### S7 — "Suspected non-axis structure (ratio / ring / periodic)"
 No threshold conjunction can express these. Diagnose the residual and synthesize
@@ -250,8 +245,9 @@ python pipeline.py --synthetic --n 200000 --features 120 --patterns 40 --jobs 6
    the data's contamination level; pick it from the user's false-positive budget.
 4. **Rarity floor (~150 positive cases/pattern).** Below it, capture is impossible
    for any method — state this rather than over-tuning.
-5. **Constraints aren't enforced in the deep path** — use post-filter (S6a) or the
-   constrained single-pass miner (S6b).
+5. **Constraints are enforced during the deep search** via `mine_rules(policy=…)`
+   — every emitted rule satisfies the `RulePolicy` (S6). Min precision / min recall
+   are separate kwargs (`min_accept_precision`, `min_recall`).
 6. **`n_jobs>1` spawns processes** (the beam is GIL-bound); needs `joblib`.
 7. **Determinism**: same `seed` + data ⇒ same rules. Vary `seed` to assess stability.
 
@@ -277,7 +273,7 @@ python -m pytest tests/ -q
 | categorical subsets | pass `categorical=...` (target-rank is automatic) |
 | missing values | pass NaN as-is (handled) |
 | deeper rules | `max_depth↑`, `target_precision↑` |
-| business constraints | `RulePolicy` + post-filter (S6a) or `targeted_beam_search(policy=)` (S6b) |
+| business / rule constraints | `mine_rules(policy=RulePolicy.build(...))` — enforced during search (S6) |
 | ratio/ring/periodic | `featgap.propose_features` → append feature → re-mine (S7) |
 | faster | `n_jobs = cores` |
 | why missed? | `featgap.remine_residual` + `interaction_screen` (S10) |

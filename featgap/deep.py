@@ -93,12 +93,27 @@ def _feature_block(Xtr, seed_rows, hist_all, cdf_all, n_bins, top_k, *,
     return np.argsort(score)[::-1][:top_k]
 
 
+def _compliant(preds, policy, nb):
+    """True if a rule (preds in ORIGINAL feature indices) satisfies the RulePolicy:
+    per-predicate (disabled feature / allowed direction / pct range), pairwise
+    (forbidden + mutually-exclusive + 1-way/2-way), and required-with."""
+    if policy is None:
+        return True
+    fs = {f for f, _, _ in preds}
+    if not all(policy.pred_ok(f, op, k, nb) for f, op, k in preds):
+        return False
+    if not all(policy.extend_ok(fs - {f}, f, op) for f, op, _ in preds):
+        return False
+    return policy.rule_ok(fs)
+
+
 def _search_block_worker(cols, sub_edges, pct, nb, schedule, min_recall,
-                         min_support, beam_width, max_depth, min_accept,
+                         min_support, beam_width, max_depth, min_accept, policy,
                          Xtr, Xva, resid_col, yv_col):
     """Relaxation search on ONE feature block -> (preds, val_prec, val_rec, used_tp)
-    for the best rule clearing min_accept, else None. Coverage is computed by the
-    caller. Top-level (picklable) so joblib can run the K seeds in parallel."""
+    for the best rule clearing min_accept AND the policy, else None. Coverage is
+    computed by the caller. Top-level (picklable) so joblib runs the K seeds in
+    parallel."""
     sub_spec = BinSpec(sub_edges, pct, nb)
     Xt, Xv = Xtr[:, cols], Xva[:, cols]
     best = None
@@ -111,6 +126,8 @@ def _search_block_worker(cols, sub_edges, pct, nb, schedule, min_recall,
             if r.val_precision < min_accept:
                 continue
             preds = tuple((cols[f], op, k) for f, op, k in r.preds)
+            if not _compliant(preds, policy, nb):      # enforce constraints (orig idx)
+                continue
             if best is None or r.val_recall > best[2]:
                 best = (preds, float(r.val_precision), float(r.val_recall), tp)
         if best is not None:
@@ -150,8 +167,8 @@ def recover_deep(Xtr, Xva, spec, ytr, yva, covered_tr, *, max_rounds=6,
                  min_accept_precision=0.3, max_misses=8,
                  min_recall=0.01, min_support=40, beam_width=64, max_depth=18,
                  subsample=80_000, n_jobs=1, min_round_gain=0, block_score="kl",
-                 seed=0, detector="lgbm", categorical=None, Xraw_tr=None,
-                 verbose=True):
+                 policy=None, seed=0, detector="lgbm", categorical=None,
+                 Xraw_tr=None, verbose=True):
     """Sequential-covering recovery of deep conjunctions on the residual.
 
     Each round: fit the detector on the still-uncovered frauds, ISOLATE the single
@@ -167,8 +184,11 @@ def recover_deep(Xtr, Xva, spec, ytr, yva, covered_tr, *, max_rounds=6,
 
     block_score: how to score a seed's feature concentration when picking the
       block -- "kl" (default), "ks" (Kolmogorov-Smirnov max-CDF-gap; order-aware,
-      the standard fraud separation metric, ideal for numeric thresholds/bands), or
-      "hybrid" (KS for numeric, KL for the nominal `categorical` columns).
+      ideal for numeric thresholds/bands), or "hybrid" (KS for numeric, KL for the
+      nominal `categorical` columns).
+    policy: optional arp.constraints.RulePolicy enforced DURING the search -- only
+      rules satisfying it (feature usage, 1-/2-way splits, allowed directions/pct
+      ranges, forbidden / mutually-exclusive pairs, required-with) are accepted.
     detector: "lgbm" (default, scalable + native missing/categorical) or "rf".
     Xraw_tr: optional raw (unbinned) matrix for the DETECTOR only (lets LightGBM
       exploit real NaN / categorical); the refine always runs on binned `Xtr`.
@@ -204,7 +224,7 @@ def recover_deep(Xtr, Xva, spec, ytr, yva, covered_tr, *, max_rounds=6,
     Xtr_s = np.ascontiguousarray(Xtr) if par else Xtr
     Xva_s = np.ascontiguousarray(Xva) if par else Xva
     wargs = (spec.pct, nb, schedule, min_recall, min_support, beam_width,
-             max_depth, min_accept_precision)
+             max_depth, min_accept_precision, policy)
     if par:
         from joblib import Parallel, delayed
     misses = 0
