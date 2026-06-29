@@ -1,19 +1,23 @@
-# attention-rule-paths (`arp`)
+# Bean
 
-**Mine interpretable conjunctive fraud rules from tabular data** — governed by
-precision/recall targets, scalable to millions of rows, and able to recover
-*deep* rules that a plain greedy beam search is fundamentally blind to.
+**Mine interpretable conjunctive rules from labeled tabular data** — governed by
+precision/recall targets, scalable to millions of rows, and able to recover *deep*
+rules that a plain greedy beam search is fundamentally blind to.
 
 A mined rule looks like this (held-out precision/recall and support in brackets):
 
 ```
-[P=0.91 R=0.18 n=2,310]  amount > p95  AND  country in {NG,GH,KE}  AND  velocity > p90
+[P=0.91 R=0.18 n=2,310]  f032 > p95  AND  f047 in {2,5,7}  AND  f018 > p90
 ```
 
 The pipeline bins the data once, then mines rules with a **sequential-covering**
 miner that uses a gradient-boosted detector to *seed* the search at patterns a
 marginal beam can't find — recovering deep conjunctions and many overlapping
 patterns while keeping every rule interpretable and independently validated.
+
+The target is any **binary label** (the "positive class" / the events you want to
+flag); the rules are conjunctions of conditions on numeric and categorical
+features.
 
 ---
 
@@ -29,13 +33,13 @@ pip install -r requirements.txt      # numpy, scikit-learn, lightgbm, joblib
 
 ```bash
 python pipeline.py --synthetic --n 200000 --features 120 --patterns 40 --jobs 6
-python pipeline.py --data tx.csv --label is_fraud --categorical mcc,country --jobs 6
+python pipeline.py --data data.csv --label target --categorical cat1,cat2 --jobs 6
 ```
 
 prints:
 
 ```
-data: 200,000 rows x 120 features, 4,012 fraud (2.01%), 10 categorical
+data: 200,000 rows x 120 features, 4,012 positive (2.01%), 10 categorical
 ... 16 rules  ->  recall=0.51  precision=0.45  flagged=3,674
   [P=0.83 R=0.078 n=46]  f020 > p88  AND  f016 > p81  AND  f001 < p12
   [P=0.77 R=0.329 n=210]  f019 < p06  AND  f047 in {4}
@@ -81,14 +85,14 @@ Numeric thresholds render as percentiles (`> p95`), categoricals as value sets
 1. **Encode** (`arp.encode`, `pipeline._encode`). Each numeric feature → 16
    equal-frequency **percentile bins** (cut-points estimated from a 100k-row
    sample — a one-time, parallel, ~14× faster step); **missing → its own bin**;
-   **categorical → fraud-rate rank** (Fisher trick: a threshold on the rank is an
-   *optimal subset* split `cat ∈ {…}`).
+   **categorical → positive-rate rank** (Fisher trick: a threshold on the rank is
+   an *optimal subset* split `cat ∈ {…}`).
 
 2. **Mine** (`featgap.recover_deep`) — sequential covering. Each round:
-   - fit a **LightGBM detector** on the residual (uncovered frauds vs the rest) —
-     a *scout*, not the model;
-   - **cluster the residual frauds by leaf co-membership** into up to `n_seeds`
-     seeds; each seed ≈ one pattern (it groups frauds on the *relevant* features
+   - fit a **LightGBM detector** on the residual (uncovered positives vs the
+     rest) — a *scout*, not the model;
+   - **cluster the residual positives by leaf co-membership** into up to `n_seeds`
+     seeds; each seed ≈ one pattern (it groups examples on the *relevant* features
      and ignores the noise ones);
    - for each seed, pick its feature **block** by KL/KS concentration vs the
      population (`block_score`), and run an **F1-ranked beam** restricted to that
@@ -131,7 +135,7 @@ featgap/        gap-driven layer on top of arp (one-directional dependency)
   gap.py          residual + axis/non-axis diagnostic
   screen.py       interaction-information / HSIC dependence screens
   synthesize.py   ring/ratio/diff/periodic feature synthesis
-synth.py        one configurable synthetic fraud generator (make_fraud)
+synth.py        one configurable synthetic data generator (make_data)
 pipeline.py     end-to-end entry point: mine_rules(X, y, ...) + CLI
 benchmark.py    one runner: capture | scale | deep | featgap | categorical
 tests/          test_basic.py
@@ -147,10 +151,10 @@ python benchmark.py featgap     300000 120       # non-axis -> feature engineeri
 python benchmark.py categorical 200000 60        # target-rank subset rules
 ```
 
-Representative result on the **500K × 200, 100-overlapping-pattern, 2% fraud**
-gauntlet (missing values, categoricals, correlated decoys, depths 2–11):
+Representative result on the **500K × 200, 100-overlapping-pattern, 2% positive
+rate** gauntlet (missing values, categoricals, correlated decoys, depths 2–11):
 **16 rules, recall 0.51, precision 0.45, all 12 statistically-mineable patterns
-captured (62% of all fraud), ~5 min on 6 cores.** Confirmed generic on a
+captured (62% of all positives), ~5 min on 6 cores.** Confirmed generic on a
 structurally different generator with no re-tuning.
 
 ## Honest limits
@@ -160,7 +164,7 @@ structurally different generator with no re-tuning.
 - **Very deep + rare + overlapping** patterns (depth ≥ ~9 *and* few cases) remain
   the hard frontier.
 - **Precision is an operating point**, set by `min_accept_precision` — it tracks
-  the data's contamination level and is a business choice, not a constant.
+  the data's contamination level and is a choice, not a constant.
 - **Scale**: encoding (~14×) and mining were validated to 2M × 1000; the recent
   multi-pattern *capture* results were measured at 200K–500K.
 

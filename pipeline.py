@@ -1,4 +1,4 @@
-"""End-to-end fraud rule mining: data in -> interpretable rules out.
+"""End-to-end rule mining: data in -> interpretable rules out.
 
 THE entry point. One call encodes the data and runs the sequential-covering deep
 miner, returning human-readable conjunctive rules with held-out precision/recall.
@@ -9,7 +9,7 @@ miner, returning human-readable conjunctive rules with held-out precision/recall
 
 CLI:
     python pipeline.py --synthetic                       # demo on generated data
-    python pipeline.py --data tx.csv --label is_fraud --categorical mcc,country
+    python pipeline.py --data tx.csv --label target --categorical mcc,country
 """
 
 from __future__ import annotations
@@ -28,7 +28,7 @@ MISSING = N_BINS                       # reserved bin code for NaN (real bins 0.
 
 
 # --------------------------------------------------------------------------- #
-# encoding: numeric -> quantile bins; categorical -> fraud-rate rank; NaN -> MISSING
+# encoding: numeric -> quantile bins; categorical -> positive-rate rank; NaN -> MISSING
 # --------------------------------------------------------------------------- #
 def _encode(Xtr, Xva, ytr, cat_set, sample, seed):
     F = Xtr.shape[1]
@@ -91,9 +91,9 @@ class Rule:
 # --------------------------------------------------------------------------- #
 def mine_rules(X, y, *, categorical=None, names=None, val_frac=0.33, seed=0,
                n_jobs=1, sample=100_000, verbose=False, **deep_kwargs):
-    """Mine interpretable fraud rules. X: (n, F) float (NaN allowed). y: (n,) 0/1.
+    """Mine interpretable rules. X: (n, F) float (NaN allowed). y: (n,) 0/1.
     `categorical`: column indices to treat as categorical. Returns (rules, eval)
-    where eval = dict(recall, precision, flagged, frauds)."""
+    where eval = dict(recall, precision, flagged, positives)."""
     X = np.asarray(X, dtype=np.float32)
     y = np.asarray(y).astype(np.int64)
     n, F = X.shape
@@ -107,12 +107,12 @@ def mine_rules(X, y, *, categorical=None, names=None, val_frac=0.33, seed=0,
 
     Xtr_b, Xva_b, spec, render = _encode(X[tr], X[va], ytr, cat_set, sample, seed + 7)
 
-    frauds = int((ytr == 1).sum())
+    npos = int((ytr == 1).sum())
     defaults = dict(max_rounds=30, top_k=22, seed_n=250, n_seeds=8,
                     target_precision=0.6, min_accept_precision=0.12, max_misses=2,
                     min_recall=0.004, min_support=20, beam_width=64, max_depth=18,
                     block_score="hybrid",
-                    min_round_gain=max(40, frauds // 100))    # relative early-stop
+                    min_round_gain=max(40, npos // 100))    # relative early-stop
     defaults.update(deep_kwargs)
     deep, info = recover_deep(Xtr_b, Xva_b, spec, ytr, yva,
                               np.zeros(len(ytr), dtype=bool),
@@ -133,7 +133,7 @@ def mine_rules(X, y, *, categorical=None, names=None, val_frac=0.33, seed=0,
     flagged = int(cov.sum())
     ev = dict(recall=float((cov & pos).sum() / max(1, int(pos.sum()))),
               precision=float((cov & pos).sum() / max(1, flagged)),
-              flagged=flagged, frauds=int(pos.sum()), n_rules=len(rules),
+              flagged=flagged, positives=int(pos.sum()), n_rules=len(rules),
               val_idx=va, val_cov=cov)        # for per-pattern / downstream analysis
     return rules, ev
 
@@ -154,7 +154,7 @@ def _load_csv(path, label, categorical):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Mine interpretable fraud rules.")
+    ap = argparse.ArgumentParser(description="Mine interpretable rules.")
     ap.add_argument("--data", help="CSV file of features + label")
     ap.add_argument("--label", default="label", help="label column name")
     ap.add_argument("--categorical", default="", help="comma-separated categorical columns")
@@ -169,12 +169,12 @@ def main():
     if args.data:
         X, y, cat_idx, names = _load_csv(args.data, args.label, args.categorical)
     else:                                              # --synthetic (default fallback)
-        from synth import make_fraud
-        fs = make_fraud(args.n, args.features, args.patterns)
+        from synth import make_data
+        fs = make_data(args.n, args.features, args.patterns)
         X, y, cat_idx, names = fs.X, fs.y, fs.categorical, fs.names
 
     print(f"data: {X.shape[0]:,} rows x {X.shape[1]} features, "
-          f"{int(y.sum()):,} fraud ({100*y.mean():.2f}%), {len(cat_idx)} categorical")
+          f"{int(y.sum()):,} positive ({100*y.mean():.2f}%), {len(cat_idx)} categorical")
     rules, ev = mine_rules(X, y, categorical=cat_idx, names=names,
                            n_jobs=args.jobs, verbose=True)
     print(f"\n{ev['n_rules']} rules  ->  recall={ev['recall']:.2f}  "

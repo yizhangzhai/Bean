@@ -1,6 +1,6 @@
-"""Synthetic fraud data -- one configurable generator for the whole project.
+"""Synthetic labeled data -- one configurable generator for the whole project.
 
-Consolidates the scattered experiment generators into a single function. A fraud
+Consolidates the scattered experiment generators into a single function. A positive
 label is fired by N hidden "modus operandi" (patterns); each pattern is a hidden
 rule we can check the miner against. Supports the full mess used in the stress
 tests: axis conjunctions of varying depth, categorical equality/subset, two-sided
@@ -8,7 +8,7 @@ bands, heavy-tailed feature distributions, correlated decoys, missing values,
 heavy-tailed pattern sizes, feature overlap, and (optionally) NON-AXIS patterns
 (ring / ratio / periodic) that need feature engineering.
 
-    fs = make_fraud(n=200_000, n_features=120, n_patterns=40, bad_rate=0.02)
+    fs = make_data(n=200_000, n_features=120, n_patterns=40, bad_rate=0.02)
     fs.X, fs.y, fs.categorical, fs.patterns
 """
 
@@ -22,7 +22,7 @@ GEO_C = (20.0, 20.0)
 
 
 @dataclass
-class FraudSet:
+class DataSet:
     X: np.ndarray            # (n, F) float32, may contain NaN
     y: np.ndarray            # (n,) int64 in {0,1}
     categorical: list        # categorical feature indices
@@ -34,8 +34,8 @@ class FraudSet:
         return [p for p in self.patterns if p["realized"] >= 150]
 
 
-def make_fraud(n=200_000, n_features=120, n_patterns=40, bad_rate=0.02, *,
-               nonaxis=False, missing=0.10, fire=0.85, seed=0) -> FraudSet:
+def make_data(n=200_000, n_features=120, n_patterns=40, bad_rate=0.02, *,
+               nonaxis=False, missing=0.10, fire=0.85, seed=0) -> DataSet:
     rng = np.random.default_rng(seed)
     n_cat = max(6, n_features // 12)
     cat_idx = list(range(n_features - n_cat, n_features))
@@ -110,7 +110,7 @@ def make_fraud(n=200_000, n_features=120, n_patterns=40, bad_rate=0.02, *,
         patterns[p]["mask"] = hit
         patterns[p]["realized"] = int(hit.sum())
         y |= hit.astype(np.int64)
-    y |= ((mo_id < 0) & (rng.random(n) < 0.0008)).astype(np.int64)   # background fraud
+    y |= ((mo_id < 0) & (rng.random(n) < 0.0008)).astype(np.int64)   # background positives
 
     # ---- inject missingness (numeric cols only, never the non-axis 0..4) ----
     if missing > 0:
@@ -120,4 +120,4 @@ def make_fraud(n=200_000, n_features=120, n_patterns=40, bad_rate=0.02, *,
             X[rng.random(n) < missing * 0.5, j] = np.nan
 
     names = [f"f{i:03d}" for i in range(n_features)]
-    return FraudSet(X, y, cat_idx, patterns, names)
+    return DataSet(X, y, cat_idx, patterns, names)

@@ -18,7 +18,7 @@ import resource
 
 import numpy as np
 
-from synth import make_fraud
+from synth import make_data
 from pipeline import mine_rules, _encode, N_BINS
 from arp.fast import rule_mask, BinSpec
 from arp.encode import quantile_edges, assign_bins
@@ -42,10 +42,10 @@ def _percov(ev, patterns):
 
 # --------------------------------------------------------------------------- #
 def capture(n=400_000, F=200, patterns=100):
-    print(f"\nCAPTURE  n={n:,} F={F} patterns={patterns}  (2% fraud, full corner-case mess)")
+    print(f"\nCAPTURE  n={n:,} F={F} patterns={patterns}  (2% positive rate, full corner-case mess)")
     t0 = time.perf_counter()
-    fs = make_fraud(n, F, patterns, bad_rate=0.02, seed=0)
-    print(f"  frauds={int(fs.y.sum()):,} ({100*fs.y.mean():.2f}%)  mineable(>=150 cases)="
+    fs = make_data(n, F, patterns, bad_rate=0.02, seed=0)
+    print(f"  positives={int(fs.y.sum()):,} ({100*fs.y.mean():.2f}%)  mineable(>=150 cases)="
           f"{len(fs.mineable)}/{patterns}  missing={int(np.isnan(fs.X).sum()):,}")
     rules, ev = mine_rules(fs.X, fs.y, categorical=fs.categorical, names=fs.names,
                            n_jobs=6, verbose=True)
@@ -54,7 +54,7 @@ def capture(n=400_000, F=200, patterns=100):
     capfr = sum(p["realized"] for p, c in zip(fs.patterns, pc) if c >= 0.5)
     print(f"\n  {ev['n_rules']} rules  recall={ev['recall']:.2f}  precision={ev['precision']:.2f}")
     print(f"  CAPTURED {cap}/{patterns} patterns "
-          f"({capfr/max(1,sum(p['realized'] for p in fs.patterns)):.0%} of all fraud)")
+          f"({capfr/max(1,sum(p['realized'] for p in fs.patterns)):.0%} of all positives)")
     for lo, hi, lab in [(150, 400, "150-400"), (400, 1500, "400-1500"), (1500, 9e9, ">=1500")]:
         ids = [i for i, p in enumerate(fs.patterns) if lo <= p["realized"] < hi]
         if ids:
@@ -65,7 +65,7 @@ def capture(n=400_000, F=200, patterns=100):
 # --------------------------------------------------------------------------- #
 def scale(n=500_000, F=300):
     print(f"\nSCALE  n={n:,} F={F}  (encode + mine timing)")
-    fs = make_fraud(n, F, 60, bad_rate=0.02, seed=0)
+    fs = make_data(n, F, 60, bad_rate=0.02, seed=0)
     t0 = time.perf_counter()
     rules, ev = mine_rules(fs.X, fs.y, categorical=fs.categorical, n_jobs=6, verbose=True)
     dt = time.perf_counter() - t0
@@ -77,7 +77,7 @@ def scale(n=500_000, F=300):
 def deep(n=200_000, F=120):
     """Plant deep conjunctions (depth 5/8/11) and check exact recovery."""
     print(f"\nDEEP  n={n:,} F={F}  (deep-conjunction recovery)")
-    fs = make_fraud(n, F, 30, bad_rate=0.03, seed=2)
+    fs = make_data(n, F, 30, bad_rate=0.03, seed=2)
     rules, ev = mine_rules(fs.X, fs.y, categorical=fs.categorical, names=fs.names,
                            n_jobs=6, verbose=True)
     pc = _percov(ev, fs.patterns)
@@ -96,7 +96,7 @@ def featgap(n=300_000, F=120):
     """Non-axis patterns (ring/ratio/periodic) -> rules miss them -> featgap
     synthesizes features -> re-mine captures them."""
     print(f"\nFEATGAP  n={n:,} F={F}  (non-axis -> feature engineering)")
-    fs = make_fraud(n, F, 30, bad_rate=0.03, nonaxis=True, missing=0.0, seed=0)
+    fs = make_data(n, F, 30, bad_rate=0.03, nonaxis=True, missing=0.0, seed=0)
     cand = [0, 1, 2, 3, 4]
     rng = np.random.default_rng(1)
     perm = rng.permutation(n); cut = int(n * 0.67); tr, va = perm[:cut], perm[cut:]
@@ -142,7 +142,7 @@ def featgap(n=300_000, F=120):
 def categorical(n=200_000, F=60):
     """code-bin vs target-rank on categorical subset patterns."""
     print(f"\nCATEGORICAL  n={n:,} F={F}  (code-bin vs target-rank subset rules)")
-    fs = make_fraud(n, F, 25, bad_rate=0.03, missing=0.0, seed=0)
+    fs = make_data(n, F, 25, bad_rate=0.03, missing=0.0, seed=0)
     sub = [p for p in fs.patterns if p["kind"] == "axis" and p.get("cat") and p["realized"] >= 150]
     print(f"  {len(sub)} categorical patterns >=150 cases")
     for cat_rank, tag in [(False, "as-numeric"), (True, "target-rank")]:
