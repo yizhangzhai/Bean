@@ -52,6 +52,29 @@ def assign_bins(col: np.ndarray, edges: np.ndarray) -> np.ndarray:
     return np.searchsorted(edges, col, side="right").astype(np.int8)
 
 
+def target_rank(codes: np.ndarray, y: np.ndarray, n_codes: int | None = None,
+                *, smoothing: float = 20.0) -> np.ndarray:
+    """Fisher-trick ordinal re-code of a *categorical* column: rank its categories
+    by SMOOTHED fraud rate, so a threshold split (`code_rank > k`) selects the
+    highest-rate categories -- the OPTIMAL subset split for a binary target. This
+    lets a nominal categorical be mined as an ordinal in the fast bin/threshold
+    pipeline and recover `cat in {…}` rules, not just `cat == c`.
+
+    Smoothing (and computing on TRAIN only) controls target-encoding leakage; the
+    held-out precision gate catches what slips through. Returns `rank_of_code`
+    (array indexed by category code).
+    """
+    codes = codes.astype(np.int64)
+    K = n_codes or int(codes.max()) + 1
+    cnt = np.bincount(codes, minlength=K).astype(float)
+    pos = np.bincount(codes, weights=y.astype(float), minlength=K)
+    base = float(y.mean())
+    rate = (pos + smoothing * base) / (cnt + smoothing)      # smoothed fraud rate
+    rank = np.empty(K, dtype=np.int64)
+    rank[np.argsort(rate)] = np.arange(K)                    # low rate -> low rank
+    return rank
+
+
 def _threads(n_threads):
     return n_threads or min(os.cpu_count() or 4, 8)
 
