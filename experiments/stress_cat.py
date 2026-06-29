@@ -27,7 +27,7 @@ MISSING = N_BINS
 
 def make_cat(n, n_features, seed, n_sub=6, n_num=6):
     rng = np.random.default_rng(seed)
-    n_cat = 8
+    n_cat = 12
     cat_idx = list(range(n_features - n_cat, n_features))
     card = {j: 8 for j in cat_idx}
     X = rng.standard_normal((n, n_features)).astype(np.float32)
@@ -35,15 +35,15 @@ def make_cat(n, n_features, seed, n_sub=6, n_num=6):
         X[:, j] = rng.integers(0, card[j], n).astype(np.float32)
     fire = 0.85
     patterns, region = [], []
-    # SUBSET patterns: cat in {3 non-contiguous codes} AND two numeric tails
+    # SUBSET patterns: PURELY categorical -- 3 conditions, each cat in {2 non-
+    # contiguous codes}. The rule MUST express the subsets (no numeric shortcut).
     for _ in range(n_sub):
-        cf = int(rng.choice(cat_idx))
-        subset = sorted(rng.choice(8, 3, replace=False).tolist())
-        nf = rng.choice(range(n_features - n_cat), 2, replace=False)
-        m = np.isin(X[:, cf], subset)
-        for f in nf:
-            m &= X[:, f] > np.quantile(X[:, f], 0.88)
-        patterns.append(dict(kind="subset", cat=cf, subset=subset))
+        cfs = rng.choice(cat_idx, 3, replace=False)
+        subs = {int(cf): sorted(rng.choice(8, 2, replace=False).tolist()) for cf in cfs}
+        m = np.ones(n, dtype=bool)
+        for cf, s in subs.items():
+            m &= np.isin(X[:, cf], s)
+        patterns.append(dict(kind="subset", conds=subs))
         region.append(m)
     # NUMERIC patterns: depth 2-4 conjunctions
     for _ in range(n_num):
@@ -132,10 +132,11 @@ def run(n=200_000, n_features=60, seed=0):
     tr, va = perm[:cut], perm[cut:]
     ytr, yva = y[tr], y[va]
     mo_va = [m[va] for m in mo]
-    print(f"  frauds={int(y.sum()):,} ({100*y.mean():.2f}%)  6 subset + 6 numeric "
-          f"patterns; subset examples: " +
-          ", ".join(f"cat{pt['cat']}∈{pt['subset']}" for pt in patterns
-                    if pt["kind"] == "subset")[:120])
+    ex = next(pt for pt in patterns if pt["kind"] == "subset")
+    print(f"  frauds={int(y.sum()):,} ({100*y.mean():.2f}%)  6 cat-only subset + "
+          f"6 numeric patterns")
+    print("  example subset pattern: " +
+          " AND ".join(f"cat{c}∈{s}" for c, s in ex["conds"].items()))
     t0 = time.perf_counter()
     for cat_rank, tag in [(False, "code-bin"), (True, "target-rank")]:
         Xtr_b, Xva_b, spec = encode(X[tr], X[va], cat_idx, ytr, seed + 7, cat_rank)
