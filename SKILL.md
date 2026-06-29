@@ -85,6 +85,9 @@ rules, ev = mine_rules(X, y, categorical=cat_idx, names=feat, n_jobs=6)
 | `n_jobs` | 1 | **parallel speed** (= core count) | — |
 | `block_score` | `"hybrid"` | `"ks"` (numeric, order-aware) / `"kl"` | — |
 | `max_rounds`,`max_misses` | 30, 2 | search longer / persist through dry rounds | stop sooner |
+| `val_gap_tol` | `None` | — | set to `0.1` to stop conjunctions that overfit (train ≫ val precision) *during* growth |
+| `serial` | `False` | `True` = most accurate (one pattern/round, no blending), slowest | — |
+| `engineer` | `None` | `True` or a dict = synthesize features for non-axis structure and re-mine (S7) | — |
 
 **`min_accept_precision` is the operating point** — it is the precision floor a
 rule must clear on held-out data. It is a *business choice* (how many false
@@ -163,16 +166,43 @@ For a fully constrained **single-pass** miner (categorical-native, no detector
 seeding) you can also call `arp.targeted.targeted_beam_search(..., policy=policy)`
 or `arp.mixed.mixed_targeted_search(..., policy=policy)` on encoded bins directly.
 
-### S7 — "Suspected non-axis structure (ratio / ring / periodic)"
-No threshold conjunction can express these. Diagnose the residual and synthesize
-features, then re-mine (see `benchmark.py featgap` for the full recipe):
+### S7 — "Suspected non-axis structure (ratio / sum / weighted / ring / periodic)"
+No raw threshold conjunction can express these. The built-in way is `engineer=`,
+which diagnoses the residual, synthesizes features, appends them, and re-mines —
+all in one call:
+```python
+rules, ev = mine_rules(
+    X, y, categorical=cat_idx, names=feat, n_jobs=6,
+    engineer=dict(
+        cols=[0, 1, 2, 3, 4],                    # candidate columns (default: top-6 by residual separation)
+        formats=("ratio", "diff", "sum", "linear", "radial", "periodic"),
+        custom=[("f0*f1", lambda A: A[:, 0] * A[:, 1])],   # any user-defined format
+        max_features=4))
+# engineered rules render with the formula as the feature name, e.g.  "f0 + f1 > p90"
+```
+Formats (`featgap.synthesize.FORMATS`): `ratio` (A/B), `diff` (A−B), `sum` (A+B),
+`linear` (w1·A + w2·B, weights fit by logistic regression on the residual), `radial`
+(dist to a detected ring center), `periodic` (A mod P), + `custom` `(name, fn)`.
+To control the loop yourself, call the synthesizer directly:
 ```python
 from featgap import propose_features
 # gap_mask = positives not covered by current rules (boolean over train rows)
 cands = propose_features(X_train[:, candidate_cols], gap_mask,
-                         [feat[c] for c in candidate_cols], max_features=4)
+                         [feat[c] for c in candidate_cols],
+                         formats=("sum", "linear"), max_features=4)
 # each cand has cand["transform"] (callable) and cand["lift"]; bin the top ones,
-# append as new columns, and call mine_rules again on the augmented matrix.
+# append as columns, and call mine_rules again on the augmented matrix.
+```
+
+### S7b — "Validation-checked growth / most-accurate (serial) mode"
+Two reliability knobs:
+- `val_gap_tol=0.1` — validate **during** conjunction: any path whose train
+  precision exceeds its held-out precision by more than the tolerance is stopped
+  rather than grown (an overfitting brake at every step, not just at acceptance).
+- `serial=True` — the original peel-one-pattern-at-a-time miner (`n_seeds=1,
+  n_jobs=1`): no within-round blending, most accurate, slowest.
+```python
+rules, ev = mine_rules(X, y, categorical=cat_idx, val_gap_tol=0.1, serial=True)
 ```
 
 ### S8 — "Large data / make it fast"
@@ -274,7 +304,9 @@ python -m pytest tests/ -q
 | missing values | pass NaN as-is (handled) |
 | deeper rules | `max_depth↑`, `target_precision↑` |
 | business / rule constraints | `mine_rules(policy=RulePolicy.build(...))` — enforced during search (S6) |
-| ratio/ring/periodic | `featgap.propose_features` → append feature → re-mine (S7) |
+| ratio/sum/weighted/ring/periodic | `mine_rules(engineer=dict(formats=...))` (S7) |
+| stop overfit growth | `mine_rules(val_gap_tol=0.1)` — validate during conjunction (S7b) |
+| most accurate (slow) | `mine_rules(serial=True)` (S7b) |
 | faster | `n_jobs = cores` |
 | why missed? | `featgap.remine_residual` + `interaction_screen` (S10) |
 | quick demo | `python pipeline.py --synthetic` |

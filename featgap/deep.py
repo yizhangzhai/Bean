@@ -109,11 +109,16 @@ def _compliant(preds, policy, nb):
 
 def _search_block_worker(cols, sub_edges, pct, nb, schedule, min_recall,
                          min_support, beam_width, max_depth, min_accept, policy,
-                         Xtr, Xva, resid_col, yv_col):
+                         val_gap_tol, Xtr, Xva, resid_col, yv_col):
     """Relaxation search on ONE feature block -> (preds, val_prec, val_rec, used_tp)
     for the best rule clearing min_accept AND the policy, else None. Coverage is
     computed by the caller. Top-level (picklable) so joblib runs the K seeds in
-    parallel."""
+    parallel.
+
+    `val_gap_tol` (if not None) is the real-time held-out brake: while a rule is
+    grown, any conjunction whose TRAIN precision exceeds its VALIDATION precision
+    by more than the tolerance is stopped, not extended -- validation-checked at
+    every conjunction step, not just at acceptance."""
     sub_spec = BinSpec(sub_edges, pct, nb)
     Xt, Xv = Xtr[:, cols], Xva[:, cols]
     best = None
@@ -121,7 +126,7 @@ def _search_block_worker(cols, sub_edges, pct, nb, schedule, min_recall,
         rules, _ = targeted_beam_search(
             Xt, resid_col, 0, sub_spec, min_recall=min_recall, target_precision=tp,
             min_support=min_support, beam_width=beam_width, max_depth=max_depth,
-            Xbin_val=Xv, Y_val=yv_col, gap_tol=None, rank_by="f1")
+            Xbin_val=Xv, Y_val=yv_col, gap_tol=val_gap_tol, rank_by="f1")
         for r in rules:
             if r.val_precision < min_accept:
                 continue
@@ -167,8 +172,8 @@ def recover_deep(Xtr, Xva, spec, ytr, yva, covered_tr, *, max_rounds=6,
                  min_accept_precision=0.3, max_misses=8,
                  min_recall=0.01, min_support=40, beam_width=64, max_depth=18,
                  subsample=80_000, n_jobs=1, min_round_gain=0, block_score="kl",
-                 policy=None, seed=0, detector="lgbm", categorical=None,
-                 Xraw_tr=None, verbose=True):
+                 policy=None, val_gap_tol=None, seed=0, detector="lgbm",
+                 categorical=None, Xraw_tr=None, verbose=True):
     """Sequential-covering recovery of deep conjunctions on the residual.
 
     Each round: fit the detector on the still-uncovered frauds, ISOLATE the single
@@ -189,6 +194,12 @@ def recover_deep(Xtr, Xva, spec, ytr, yva, covered_tr, *, max_rounds=6,
     policy: optional arp.constraints.RulePolicy enforced DURING the search -- only
       rules satisfying it (feature usage, 1-/2-way splits, allowed directions/pct
       ranges, forbidden / mutually-exclusive pairs, required-with) are accepted.
+    val_gap_tol: optional real-time held-out brake. When set (e.g. 0.1), every
+      conjunction is scored on the VALIDATION split as it grows, and any path whose
+      train precision exceeds its val precision by more than the tolerance is
+      stopped instead of extended -- validation-checked at each conjunction step,
+      not only at final acceptance. None (default) grows on train and validates at
+      acceptance.
     detector: "lgbm" (default, scalable + native missing/categorical) or "rf".
     Xraw_tr: optional raw (unbinned) matrix for the DETECTOR only (lets LightGBM
       exploit real NaN / categorical); the refine always runs on binned `Xtr`.
@@ -224,7 +235,7 @@ def recover_deep(Xtr, Xva, spec, ytr, yva, covered_tr, *, max_rounds=6,
     Xtr_s = np.ascontiguousarray(Xtr) if par else Xtr
     Xva_s = np.ascontiguousarray(Xva) if par else Xva
     wargs = (spec.pct, nb, schedule, min_recall, min_support, beam_width,
-             max_depth, min_accept_precision, policy)
+             max_depth, min_accept_precision, policy, val_gap_tol)
     if par:
         from joblib import Parallel, delayed
     misses = 0

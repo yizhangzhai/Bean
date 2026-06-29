@@ -78,11 +78,49 @@ Numeric thresholds render as percentiles (`> p95`), categoricals as value sets
 | `block_score` | `"hybrid"` | feature-block scorer: `kl` / `ks` / `hybrid` (KS numeric + KL categorical) |
 | `max_misses` | 2 | consecutive low-yield rounds before stopping |
 | `policy` | `None` | `RulePolicy` enforced during search: feature usage, 1-/2-way splits, forbidden / mutually-exclusive pairs, allowed directions & ranges, required-with |
+| `val_gap_tol` | `None` | real-time held-out brake: stop growing a conjunction once train precision exceeds its validation precision by more than this (e.g. `0.1`) |
+| `serial` | `False` | force the fully-serial peel-one-pattern-at-a-time miner (`n_seeds=1, n_jobs=1`): most accurate, slowest |
+| `engineer` | `None` | run a feature-engineering second pass (`True` or a config dict) — see below |
 
 **Rule-level constraints** are first-class: precision/recall floors are the
 `min_accept_precision` / `min_recall` kwargs, and structural constraints go through
 `policy=RulePolicy.build(monotone_up=…, disable=…, forbidden_pairs=…, ranges=…, …)`
 — see `SKILL.md` §S6.
+
+**Validation-checked growth.** By default rules grow on the training split and are
+validated at acceptance (`min_accept_precision` on held-out). Pass `val_gap_tol=0.1`
+to validate *during* growth: any conjunction whose train precision outruns its
+held-out precision by more than the tolerance is stopped instead of extended — an
+overfitting brake checked at every conjunction step.
+
+**Serial mode.** `mine_rules(..., serial=True)` runs the original
+peel-one-pattern-at-a-time miner (one seed per round, no parallelism). It is the
+most accurate setting (no within-round blending) at the cost of runtime; the
+default (`n_seeds=8, n_jobs>1`) trades a little accuracy for several patterns per
+detector fit.
+
+**Feature engineering.** `mine_rules(..., engineer=True)` adds a second pass: it
+diagnoses the residual (uncovered positives), synthesizes candidate features, bins
+and appends them, and re-mines — so patterns no axis-aligned threshold can express
+(ratio / sum / weighted / ring / periodic) become simple rules. Configure with a
+dict:
+
+```python
+rules, ev = mine_rules(
+    X, y, categorical=cat,
+    engineer=dict(
+        cols=[0, 1, 2, 3, 4],                       # candidate columns (default: top-6 by residual separation)
+        formats=("ratio", "diff", "sum", "linear", "radial", "periodic"),
+        custom=[("f0*f1", lambda A: A[:, 0] * A[:, 1])],   # user-defined formats
+        max_features=4))
+```
+
+Formats (`featgap.synthesize.FORMATS`): `ratio` (A/B), `diff` (A−B), `sum` (A+B),
+`linear` (w1·A + w2·B, weights fit by logistic regression on the residual),
+`radial` (dist to a detected ring center), `periodic` (A mod P), plus any `custom`
+`(name, fn)` expressions. Engineered rules render with the formula as the feature
+name, e.g. `f0 + f1 > p90`. The synthesizer is also callable directly:
+`from featgap import propose_features`.
 
 ---
 
