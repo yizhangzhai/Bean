@@ -64,10 +64,15 @@ def _encode(Xtr, Xva, ytr, cat_set, sample, seed):
     return btr.T, bva.T, BinSpec(edges, qs, N_BINS + 1), render
 
 
-def _render_pred(f, op, k, render, names):
+def _render_pred(f, op, k, render, names, spec=None):
     if render[f][0] == "num":
         pct = int(round((k + 1) / N_BINS * 100))
         return f"{names[f]} {op} p{pct:02d}"
+    if render[f][0] == "cmp":                          # comparison: real threshold
+        edges = spec.edges[f]
+        thr = float(edges[min(k, len(edges) - 1)])
+        tval = "0" if abs(thr) < 1e-9 else f"{thr:.4g}"
+        return f"{render[f][1]} {op} {tval}"           # e.g.  "A - B > 0"  /  "(C-D)*A/B > 0.42"
     rk = render[f][1]                                  # code -> rank
     keep = [c for c, r in enumerate(rk) if (r > k if op == ">" else r <= k)]
     if op == ">" and k == MISSING - 1:                # isolates the missing bin
@@ -108,50 +113,75 @@ def _residual_cols(Xtr_raw, resid, cat_set, n_cand):
     return [f for _, f in score[:n_cand]]
 
 
+def _bin_edges(v, qs, rng, *, snap_zero=False):
+    """Quantile edges for a margin column; optionally snap the nearest edge to 0
+    so a comparison (margin > 0) is an EXACT cut, when 0 lies inside the range."""
+    e = quantile_edges(v, qs, sample=100_000, rng=rng)
+    if snap_zero and v.min() < 0 < v.max():
+        e[int(np.argmin(np.abs(e)))] = 0.0
+        e = np.sort(e)
+    return e
+
+
 def _engineer(Xtr_b, Xva_b, spec, render, names, Xtr_raw, Xva_raw, ytr,
               base_rules, cat_set, seed, opts):
-    """Second-pass feature engineering. Diagnose the residual of `base_rules`,
-    synthesize features in the requested `formats`, bin them, and append as new
-    columns. Returns (Xtr_aug, Xva_aug, spec_aug, render_aug, names_aug, eng,
-    covered_tr) where covered_tr is the base-rule coverage on TRAIN (the start
-    point for the second mine)."""
+    """Second-pass feature engineering. Two sources, both appended as columns then
+    re-mined:
+      * synthesized features from the residual of `base_rules` (`formats`/`custom`
+        in propose_features) -- binned by quantiles, rendered as `name op pXX`;
+      * user `compare` relations -- each (label, fn) where fn(X)->margin (LHS-RHS,
+        the relation holds when margin>0); binned with 0 as an exact cut, rendered
+        with the REAL threshold (`label op value`), so `A > w*B` shows the w.
+
+    Returns (Xtr_aug, Xva_aug, spec_aug, render_aug, names_aug, added, covered_tr);
+    `added` lists the new feature labels, `covered_tr` is the base-rule TRAIN
+    coverage (the start point for the second mine)."""
     covered_tr = np.zeros(len(ytr), dtype=bool)
     for preds in base_rules:
         covered_tr |= rule_mask(preds, Xtr_b)
     resid = (ytr == 1) & ~covered_tr
 
+    qs = np.arange(1, N_BINS) / N_BINS
+    rng = np.random.default_rng(seed + 11)
+    Xt_all = np.nan_to_num(np.asarray(Xtr_raw, dtype=np.float64))   # full matrix for compare
+    Xv_all = np.nan_to_num(np.asarray(Xva_raw, dtype=np.float64))
+    new_tr, new_va, new_edges, new_render, added = [], [], [], [], []
+
+    # 1) residual-driven synthesis (ratio / sum / linear / radial / periodic / custom)
     cols = opts.get("cols")
     if cols is None:
         cols = _residual_cols(Xtr_raw, resid, cat_set, opts.get("n_cand", 6))
-    if len(cols) < 1 or int(resid.sum()) < 30:
-        return Xtr_b, Xva_b, spec, render, names, [], covered_tr
+    if cols and int(resid.sum()) >= 30 and opts.get("formats", FORMATS):
+        sub = np.nan_to_num(Xtr_raw[:, cols].astype(np.float64))
+        eng = propose_features(sub, resid, [names[c] for c in cols],
+                               formats=opts.get("formats", FORMATS),
+                               custom=opts.get("custom"),
+                               max_features=opts.get("max_features", 4))
+        full_tr, full_va = Xt_all[:, cols], Xv_all[:, cols]
+        for c in eng:
+            vt = np.nan_to_num(np.asarray(c["transform"](full_tr), dtype=np.float64))
+            vv = np.nan_to_num(np.asarray(c["transform"](full_va), dtype=np.float64))
+            e = _bin_edges(vt, qs, rng)
+            new_tr.append(assign_bins(vt, e)[:, None]); new_va.append(assign_bins(vv, e)[:, None])
+            new_edges.append(e); new_render.append(("num",)); added.append(c["name"])
 
-    sub = np.nan_to_num(Xtr_raw[:, cols].astype(np.float64))
-    eng = propose_features(sub, resid, [names[c] for c in cols],
-                           formats=opts.get("formats", FORMATS),
-                           custom=opts.get("custom"),
-                           max_features=opts.get("max_features", 4))
-    if not eng:
-        return Xtr_b, Xva_b, spec, render, names, [], covered_tr
+    # 2) user comparison relations: A>B, A>w*B, A<(B+C+D)*w, (C-D)<(A-B), ...
+    #    each fn(X) returns the margin LHS-RHS (relation holds when > 0)
+    for label, fn in opts.get("compare", []):
+        vt = np.nan_to_num(np.asarray(fn(Xt_all), dtype=np.float64))
+        vv = np.nan_to_num(np.asarray(fn(Xv_all), dtype=np.float64))
+        e = _bin_edges(vt, qs, rng, snap_zero=True)
+        new_tr.append(assign_bins(vt, e)[:, None]); new_va.append(assign_bins(vv, e)[:, None])
+        new_edges.append(e); new_render.append(("cmp", label)); added.append(label)
 
-    qs = np.arange(1, N_BINS) / N_BINS
-    rng = np.random.default_rng(seed + 11)
-    full_tr = np.nan_to_num(Xtr_raw[:, cols].astype(np.float64))
-    full_va = np.nan_to_num(Xva_raw[:, cols].astype(np.float64))
-    new_tr, new_va, new_edges = [], [], []
-    for c in eng:
-        vt = np.nan_to_num(np.asarray(c["transform"](full_tr), dtype=np.float64))
-        vv = np.nan_to_num(np.asarray(c["transform"](full_va), dtype=np.float64))
-        e = quantile_edges(vt, qs, sample=100_000, rng=rng)
-        new_tr.append(assign_bins(vt, e)[:, None])
-        new_va.append(assign_bins(vv, e)[:, None])
-        new_edges.append(e)
+    if not new_tr:
+        return Xtr_b, Xva_b, spec, render, names, [], covered_tr
     Xtr_aug = np.concatenate([np.asarray(Xtr_b)] + new_tr, axis=1)
     Xva_aug = np.concatenate([np.asarray(Xva_b)] + new_va, axis=1)
     spec_aug = BinSpec(list(spec.edges) + new_edges, spec.pct, spec.n_bins)
-    names_aug = list(names) + [c["name"] for c in eng]
-    render_aug = list(render) + [("num",)] * len(eng)
-    return Xtr_aug, Xva_aug, spec_aug, render_aug, names_aug, eng, covered_tr
+    names_aug = list(names) + added
+    render_aug = list(render) + new_render
+    return Xtr_aug, Xva_aug, spec_aug, render_aug, names_aug, added, covered_tr
 
 
 # --------------------------------------------------------------------------- #
@@ -159,7 +189,7 @@ def _engineer(Xtr_b, Xva_b, spec, render, names, Xtr_raw, Xva_raw, ytr,
 # --------------------------------------------------------------------------- #
 def mine_rules(X, y, *, categorical=None, names=None, val_frac=0.33, seed=0,
                n_jobs=1, sample=100_000, serial=False, engineer=None,
-               verbose=False, **deep_kwargs):
+               val_gap_tol=None, verbose=False, **deep_kwargs):
     """Mine interpretable rules. X: (n, F) float (NaN allowed). y: (n,) 0/1.
     `categorical`: column indices to treat as categorical. Returns (rules, eval)
     where eval = dict(recall, precision, flagged, positives, n_rules, val_idx, val_cov).
@@ -183,12 +213,24 @@ def mine_rules(X, y, *, categorical=None, names=None, val_frac=0.33, seed=0,
       serial   -- force the fully-serial peel-one-pattern-at-a-time miner
                   (n_seeds=1, n_jobs=1): most accurate, slowest. Overrides n_jobs.
       engineer -- run a second feature-engineering pass. True for defaults, or a
-                  dict to configure: cols (candidate columns; default top-6 numeric
-                  by residual separation), formats (subset of A/B, A-B, A+B,
-                  w1*A+w2*B, radial, periodic -- see featgap.synthesize.FORMATS),
-                  custom ([(name, fn) ...] user-defined formats), max_features,
-                  n_cand. Synthesized features are appended and the residual re-mined;
-                  engineered rules render with the formula as the feature name."""
+                  dict to configure:
+                    cols        candidate columns (default top-6 numeric by residual
+                                separation)
+                    formats     subset of A/B, A-B, A+B, w1*A+w2*B, radial, periodic
+                                (featgap.synthesize.FORMATS); () to skip synthesis
+                    custom      [(name, fn) ...] user-defined numeric transforms
+                    compare     [(label, fn) ...] COMPARISON relations between feature
+                                expressions -- fn(X)->margin (LHS-RHS; relation holds
+                                when margin>0), evaluated on the FULL matrix by
+                                original index. Handles A>B, A>w*B, A<(B+C+D)*w,
+                                (C-D)<(A-B), (C-D)*A/B>w, etc. Binned with 0 as an
+                                exact cut; rules render with the real threshold
+                                (e.g. "A - B > 0", "(C-D)*A/B > 0.42" -- the w is the
+                                discovered cut).
+                    max_features, n_cand
+                  Engineered + comparison features are appended and the residual
+                  re-mined; synthesized rules render `name op pXX`, comparison rules
+                  `label op value`."""
     X = np.asarray(X, dtype=np.float32)
     y = np.asarray(y).astype(np.int64)
     n, F = X.shape
@@ -206,7 +248,7 @@ def mine_rules(X, y, *, categorical=None, names=None, val_frac=0.33, seed=0,
     defaults = dict(max_rounds=30, top_k=22, seed_n=250, n_seeds=8,
                     target_precision=0.6, min_accept_precision=0.12, max_misses=2,
                     min_recall=0.004, min_support=20, beam_width=64, max_depth=18,
-                    block_score="hybrid",
+                    block_score="hybrid", val_gap_tol=val_gap_tol,
                     min_round_gain=max(40, npos // 100))    # relative early-stop
     defaults.update(deep_kwargs)
     if serial:                          # most accurate: one pattern at a time
@@ -219,19 +261,17 @@ def mine_rules(X, y, *, categorical=None, names=None, val_frac=0.33, seed=0,
 
     if engineer is not None and engineer is not False:
         opts = {} if engineer is True else dict(engineer)
-        Xtr_b, Xva_b, spec, render, names, eng, cov_tr = _engineer(
+        Xtr_b, Xva_b, spec, render, names, added, cov_tr = _engineer(
             Xtr_b, Xva_b, spec, render, names, X[tr], X[va], ytr, deep,
             cat_set, seed, opts)
-        if eng:                         # re-mine the residual with engineered cols
-            ed = dict(defaults)
-            ed.pop("categorical", None)
+        if added:                       # re-mine the residual with engineered cols
             deep2, _ = recover_deep(Xtr_b, Xva_b, spec, ytr, yva, cov_tr,
                                     categorical=list(cat_set), n_jobs=n_jobs,
-                                    seed=seed + 1, verbose=verbose, **ed)
+                                    seed=seed + 1, verbose=verbose, **defaults)
             deep = list(deep) + list(deep2)
             if verbose:
-                print(f"  [engineer] +{len(eng)} features, +{len(deep2)} rules: "
-                      + ", ".join(c["name"] for c in eng))
+                print(f"  [engineer] +{len(added)} features, +{len(deep2)} rules: "
+                      + ", ".join(added))
 
     pos = yva == 1
     cov = np.zeros(len(yva), dtype=bool)
@@ -241,7 +281,7 @@ def mine_rules(X, y, *, categorical=None, names=None, val_frac=0.33, seed=0,
         cov |= m
         s = int(m.sum())
         tp = int((m & pos).sum())
-        text = "  AND  ".join(_render_pred(f, op, k, render, names) for f, op, k in preds)
+        text = "  AND  ".join(_render_pred(f, op, k, render, names, spec) for f, op, k in preds)
         rules.append(Rule(text, tp / max(1, s), tp / max(1, int(pos.sum())), s, preds))
     rules.sort(key=lambda r: r.recall, reverse=True)
     flagged = int(cov.sum())

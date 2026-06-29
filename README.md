@@ -122,6 +122,31 @@ Formats (`featgap.synthesize.FORMATS`): `ratio` (A/B), `diff` (A−B), `sum` (A+
 name, e.g. `f0 + f1 > p90`. The synthesizer is also callable directly:
 `from featgap import propose_features`.
 
+**Comparison / relational features.** To put *one feature expression against
+another* — `A > B`, `A > w·B`, `A < (B+C+D)·w`, `(C−D) < (A−B)`, `(C−D)·A/B > w` —
+pass `compare`, a list of `(label, fn)` where `fn(X)` returns the **margin**
+`LHS − RHS` (the relation holds when the margin is `> 0`), evaluated on the full
+matrix by original column index:
+
+```python
+rules, ev = mine_rules(
+    X, y, engineer=dict(
+        formats=(),                                   # comparisons only (skip auto-synthesis)
+        compare=[
+            ("f0 - f1",          lambda X: X[:, 0] - X[:, 1]),               # A > B
+            ("f0 - 1.5*f1",      lambda X: X[:, 0] - 1.5 * X[:, 1]),         # A > 1.5·B
+            ("(f1+f2+f3)*.3 - f0", lambda X: (X[:,1]+X[:,2]+X[:,3])*.3 - X[:,0]),  # A < (B+C+D)·w
+            ("(f2-f3)-(f0-f1)",  lambda X: (X[:,2]-X[:,3]) - (X[:,0]-X[:,1])),  # (C−D) < (A−B)
+            ("(f2-f3)*f0/f1",    lambda X: (X[:,2]-X[:,3]) * X[:,0] / (np.abs(X[:,1])+1e-6)),  # >w
+        ]))
+```
+
+The margin is binned with **0 as an exact cut**, so the relation is representable
+exactly, and the rule renders with the **real threshold**, e.g. `f0 - f1 > 0`
+(= `A > B`) or `(f2-f3)*f0/f1 > 0.42` — for a `> w` relation the printed value *is*
+the discovered `w`. Any expression of any number of columns works; fix the weight
+inside `fn` (`A − 1.5·B`) or leave it free and let the threshold search find it.
+
 ---
 
 ## How it works

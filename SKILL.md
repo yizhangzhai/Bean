@@ -194,6 +194,28 @@ cands = propose_features(X_train[:, candidate_cols], gap_mask,
 # append as columns, and call mine_rules again on the augmented matrix.
 ```
 
+### S7c — "Compare one feature expression against another (A>B, A>w·B, …)"
+For *relational* conditions (not a numeric band) use `engineer=dict(compare=…)`.
+Each entry is `(label, fn)` where `fn(X)` returns the **margin LHS−RHS** on the
+full matrix (the relation holds when margin > 0). The margin is binned with 0 as
+an exact cut, and the rule renders with the real threshold (`label op value`):
+```python
+import numpy as np
+rules, ev = mine_rules(X, y, categorical=cat_idx, engineer=dict(
+    formats=(),                                       # comparisons only
+    compare=[
+        ("f0 - f1",         lambda X: X[:,0] - X[:,1]),                 # A > B
+        ("f0 - 1.5*f1",     lambda X: X[:,0] - 1.5*X[:,1]),            # A > 1.5·B
+        ("f0 - (f1+f2+f3)*.3", lambda X: X[:,0] - (X[:,1]+X[:,2]+X[:,3])*.3),  # A > (B+C+D)·w
+        ("(f0-f1)-(f2-f3)", lambda X: (X[:,0]-X[:,1]) - (X[:,2]-X[:,3])),     # (A−B) > (C−D)
+        ("(f2-f3)*f0/f1",   lambda X: (X[:,2]-X[:,3])*X[:,0]/(np.abs(X[:,1])+1e-6)),  # >w
+    ]))
+# rules render e.g. "f0 - f1 > 0" (= A>B) or "(f2-f3)*f0/f1 > 0.42" (the w is the cut)
+```
+Rule of thumb: write the relation as `LHS − RHS` in the lambda. Fix a weight inside
+`fn` for a hard `A > 1.5·B`; leave it free (`A/B`, `A−B`) and the threshold search
+discovers the best `w`. Works for any number of columns and any algebra.
+
 ### S7b — "Validation-checked growth / most-accurate (serial) mode"
 Two reliability knobs:
 - `val_gap_tol=0.1` — validate **during** conjunction: any path whose train
@@ -305,6 +327,7 @@ python -m pytest tests/ -q
 | deeper rules | `max_depth↑`, `target_precision↑` |
 | business / rule constraints | `mine_rules(policy=RulePolicy.build(...))` — enforced during search (S6) |
 | ratio/sum/weighted/ring/periodic | `mine_rules(engineer=dict(formats=...))` (S7) |
+| compare features (A>B, A>w·B, …) | `mine_rules(engineer=dict(compare=[(label, fn)]))` (S7c) |
 | stop overfit growth | `mine_rules(val_gap_tol=0.1)` — validate during conjunction (S7b) |
 | most accurate (slow) | `mine_rules(serial=True)` (S7b) |
 | faster | `n_jobs = cores` |
